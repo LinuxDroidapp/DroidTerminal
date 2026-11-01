@@ -1,0 +1,63 @@
+name: DroidTerminal CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Debug APK & Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager --install "ndk;25.2.9519653" "cmake;3.22.1"
+
+      - name: Run Native C++ Tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra \
+              -I app/src/main/cpp/include \
+              app/src/main/cpp/pty/process_manager.cpp \
+              app/src/main/cpp/pty/io_loop.cpp \
+              app/src/main/cpp/pty/terminal_resize.cpp \
+              tests/native/test_pty_engine.cpp \
+              -o test_pty_engine -lutil -lpthread
+          ./test_pty_engine
+
+      - name: Run Python VT Parser Test Suite
+        run: |
+          python3 tests/native/test_parser.py
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew || true
+
+      - name: Build Debug APK with Gradle
+        run: |
+          if [ -f "./gradlew" ]; then
+            ./gradlew assembleDebug --stacktrace
+          else
+            gradle assembleDebug --stacktrace
+          fi
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidTerminal-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 1
