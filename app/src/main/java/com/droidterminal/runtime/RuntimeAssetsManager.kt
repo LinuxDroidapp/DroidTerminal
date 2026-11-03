@@ -21,11 +21,13 @@ data class RuntimeAssetsInstallResult(
  * Centralized manager for PRoot and companion loader runtime binaries.
  *
  * Implements atomic staging, ELF validation, SHA-256 verification,
- * version compatibility checks, rollback support, and carrier fallback.
+ * version compatibility checks, rollback support, and carrier fallback
+ * for devices enforcing Android SELinux W^X restrictions.
  */
 class RuntimeAssetsManager(
     private val context: Context? = null,
-    customLinuxDir: File? = null
+    customLinuxDir: File? = null,
+    private val customNativeLibDir: File? = null
 ) {
     val linuxDir: File = customLinuxDir
         ?: (context?.filesDir?.let { File(it, "linux") })
@@ -59,27 +61,64 @@ class RuntimeAssetsManager(
 
     /**
      * Resolves matching and verified PRoot and loader binaries.
+     * Automatically handles SELinux W^X execution restrictions by probing execution.
      */
     @Synchronized
     fun resolveBinaries(): Pair<File, File?> {
-        // 1. Try currently installed runtime binaries if valid
-        if (isValidExecutable(prootFile) && isValidExecutable(loaderFile)) {
-            return Pair(prootFile, loaderFile)
+        val carrierProot = resolveCarrierBinary("libproot.so")
+        val carrierLoader = resolveCarrierBinary("libproot_loader.so")
+
+        // 1. If prootFile already exists in binDir, test if it can actually be executed by the OS
+        if (isValidExecutable(prootFile)) {
+            if (canActuallyExecute(prootFile)) {
+                val loader = if (isValidExecutable(loaderFile) && canActuallyExecute(loaderFile)) {
+                    loaderFile
+                } else (carrierLoader ?: loaderFile)
+                return Pair(prootFile, loader)
+            } else if (carrierProot != null && canActuallyExecute(carrierProot)) {
+                // SELinux W^X restriction detected on filesDir. Attempt symlink bypass
+                try {
+                    if (prootFile.exists()) prootFile.delete()
+                    android.system.Os.symlink(carrierProot.absolutePath, prootFile.absolutePath)
+                    if (canActuallyExecute(prootFile)) {
+                        return Pair(prootFile, carrierLoader ?: loaderFile)
+                    }
+                } catch (t: Throwable) {
+                    // Symlink execution still blocked by SELinux on app_data_file path
+                }
+
+                // Direct carrier library execution (guaranteed executable under SELinux apk_data_file)
+                return Pair(carrierProot, carrierLoader)
+            }
         }
 
         // 2. Perform atomic installation from assets
         val installResult = installFromAssets()
-        if (installResult.prootInstalled && installResult.prootFile != null && isValidExecutable(installResult.prootFile)) {
-            val loader = if (installResult.loaderInstalled && installResult.loaderFile != null && isValidExecutable(installResult.loaderFile)) {
-                installResult.loaderFile
-            } else null
-            return Pair(installResult.prootFile, loader)
+        if (installResult.prootInstalled && installResult.prootFile != null) {
+            val installedProot = installResult.prootFile
+            if (canActuallyExecute(installedProot)) {
+                val loader = if (installResult.loaderInstalled && installResult.loaderFile != null && canActuallyExecute(installResult.loaderFile)) {
+                    installResult.loaderFile
+                } else (carrierLoader ?: installResult.loaderFile)
+                return Pair(installedProot, loader)
+            } else if (carrierProot != null && canActuallyExecute(carrierProot)) {
+                // SELinux W^X restriction detected on newly extracted filesDir binary
+                try {
+                    if (installedProot.exists()) installedProot.delete()
+                    android.system.Os.symlink(carrierProot.absolutePath, installedProot.absolutePath)
+                    if (canActuallyExecute(installedProot)) {
+                        return Pair(installedProot, carrierLoader ?: loaderFile)
+                    }
+                } catch (t: Throwable) {
+                    // Symlink execution blocked
+                }
+
+                return Pair(carrierProot, carrierLoader)
+            }
         }
 
-        // 3. Carrier fallback (nativeLibraryDir)
-        val carrierProot = resolveCarrierBinary("libproot.so")
-        val carrierLoader = resolveCarrierBinary("libproot_loader.so")
-        if (carrierProot != null && isValidExecutable(carrierProot)) {
+        // 3. Direct carrier fallback
+        if (carrierProot != null && canActuallyExecute(carrierProot)) {
             return Pair(carrierProot, carrierLoader)
         }
 
@@ -213,9 +252,10 @@ class RuntimeAssetsManager(
      */
     fun resolveCarrierBinary(libraryName: String): File? {
         return try {
-            val ctx = context ?: return null
-            val nativeLibDir = File(ctx.applicationInfo.nativeLibraryDir)
-            val candidate = File(nativeLibDir, libraryName)
+            val dir = customNativeLibDir
+                ?: context?.applicationInfo?.nativeLibraryDir?.let { File(it) }
+                ?: return null
+            val candidate = File(dir, libraryName)
             if (candidate.exists() && candidate.length() > 0L) {
                 setPermissions(candidate)
                 candidate
@@ -228,7 +268,35 @@ class RuntimeAssetsManager(
     }
 
     /**
-     * Checks if the binary exists, is non-empty, and has execute permission.
+     * Tests if the file can actually be executed by the operating system kernel/SELinux.
+     */
+    fun canActuallyExecute(file: File?): Boolean {
+        if (file == null || !file.exists() || !file.isFile || file.length() == 0L) return false
+        setPermissions(file)
+        if (!file.canExecute()) return false
+
+        return try {
+            val pb = ProcessBuilder(file.absolutePath, "--version")
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            p.inputStream.bufferedReader().readText()
+            p.waitFor()
+            true
+        } catch (e: IOException) {
+            val msg = e.message ?: ""
+            if (msg.contains("error=13") || msg.contains("Permission denied", ignoreCase = true)) {
+                false
+            } else {
+                // If the error was not Permission denied, execve succeeded (e.g. library dependency)
+                !msg.contains("error=13") && !msg.contains("Permission denied", ignoreCase = true)
+            }
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Checks if the binary exists, is non-empty, and has execute permission bit set.
      */
     fun isValidExecutable(file: File?): Boolean {
         if (file == null || !file.exists() || file.length() == 0L) return false

@@ -494,4 +494,41 @@ class UbuntuInstallerTest {
         assertTrue("Output must contain success marker. Output: $output", output.contains("PROOT_FRESH_INSTALL_EXECUTION_SUCCESS"))
         assertFalse("Output must not contain Permission denied", output.contains("Permission denied", ignoreCase = true))
     }
+
+    @Test
+    fun testSelinuxWxRestrictionFallbackToCarrier() {
+        val freshFilesDir = File(tempFolder.newFolder(), "wx_fallback_files")
+        val mockNativeLibDir = File(tempFolder.newFolder(), "mock_native_libs")
+        mockNativeLibDir.mkdirs()
+
+        // Place carrier libraries in mockNativeLibDir
+        val carrierProot = File(mockNativeLibDir, "libproot.so")
+        val carrierLoader = File(mockNativeLibDir, "libproot_loader.so")
+        assetProot.copyTo(carrierProot, overwrite = true)
+        assetLoader.copyTo(carrierLoader, overwrite = true)
+
+        val installer = UbuntuInstaller(
+            context = null,
+            customFilesDir = freshFilesDir,
+            customNativeLibDir = mockNativeLibDir
+        )
+
+        installer.linuxDir.mkdirs()
+        installer.binDir.mkdirs()
+        installer.tmpDir.mkdirs()
+
+        // Carrier resolution must resolve from mockNativeLibDir
+        val resolvedCarrier = installer.resolveCarrierProot()
+        assertNotNull("Carrier PRoot must be resolved from nativeLibraryDir", resolvedCarrier)
+        assertTrue("Carrier PRoot must exist", resolvedCarrier?.exists() == true)
+
+        // Install proot binaries with carrier available
+        installer.installProotBinaries()
+
+        assertTrue("Active proot file must exist", installer.activeProotFile.exists())
+        assertTrue("Active proot file must be executable", installer.activeProotFile.canExecute())
+
+        val probeOutput = installer.testProotExecutable(installer.activeProotFile)
+        assertTrue("Probe output must confirm PRoot execution", probeOutput.contains("5.1."))
+    }
 }

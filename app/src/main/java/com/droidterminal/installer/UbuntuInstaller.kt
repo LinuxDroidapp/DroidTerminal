@@ -54,7 +54,8 @@ data class InstallState(
 
 class UbuntuInstaller(
     private val context: Context? = null,
-    customFilesDir: File? = null
+    customFilesDir: File? = null,
+    customNativeLibDir: File? = null
 ) {
     val filesDir: File = customFilesDir
         ?: context?.filesDir
@@ -73,7 +74,7 @@ class UbuntuInstaller(
     val prootFile: File = File(binDir, "proot")
     val loaderFile: File = File(binDir, "loader")
 
-    val assetsManager = RuntimeAssetsManager(context, linuxDir)
+    val assetsManager = RuntimeAssetsManager(context, linuxDir, customNativeLibDir)
 
     var activeProotFile: File = prootFile
         internal set
@@ -650,17 +651,32 @@ class UbuntuInstaller(
     }
 
     /**
+     * Resolves the carrier PRoot library (libproot.so) from nativeLibraryDir.
+     */
+    fun resolveCarrierProot(): File? = assetsManager.resolveCarrierBinary("libproot.so")
+
+    /**
+     * Resolves the carrier loader library (libproot_loader.so) from nativeLibraryDir.
+     */
+    fun resolveCarrierLoader(): File? = assetsManager.resolveCarrierBinary("libproot_loader.so")
+
+    /**
      * Executes a lightweight probe command with PRoot to verify execution capability.
      */
     fun testProotExecutable(prootBin: File): String {
+        if (!tmpDir.exists()) {
+            tmpDir.mkdirs()
+            setStickyPermissions(tmpDir)
+        }
         val pb = ProcessBuilder(prootBin.absolutePath, "--version")
         pb.redirectErrorStream(true)
         val env = pb.environment()
         if (tmpDir.exists()) {
             env["PROOT_TMP_DIR"] = tmpDir.canonicalPath
         }
-        if (loaderFile.exists()) {
-            env["PROOT_LOADER"] = loaderFile.canonicalPath
+        val loader = activeLoaderFile ?: if (loaderFile.exists()) loaderFile else null
+        if (loader?.exists() == true) {
+            env["PROOT_LOADER"] = loader.canonicalPath
         }
         val process = pb.start()
         val output = process.inputStream.bufferedReader().readText()
@@ -673,6 +689,7 @@ class UbuntuInstaller(
 
     /**
      * Installs, sets executable permissions, and validates the PRoot runtime binaries.
+     * Implements multi-tier Android SELinux W^X detection and carrier fallback.
      */
     internal fun installProotBinaries() {
         val path = prootFile.absolutePath
@@ -704,8 +721,46 @@ class UbuntuInstaller(
             testProotExecutable(activeProotFile)
         } catch (e: IOException) {
             val errorMsg = e.message ?: ""
-            val diagMsg = "Cannot run program \"${activeProotFile.absolutePath}\": $errorMsg"
-            throw IllegalStateException("PRoot execution failed in Stage 6 (PREPARING_PROOT): $diagMsg", e)
+            if (errorMsg.contains("error=13") || errorMsg.contains("Permission denied", ignoreCase = true)) {
+                // SELinux W^X restriction detected on writable app_data_file directory.
+                // The Linux kernel blocks direct execve on files in /data/user/0/<pkg>/files/.
+                val carrier = resolveCarrierProot()
+                val carrierLoader = resolveCarrierLoader()
+                var bypassSuccess = false
+
+                if (carrier != null && carrier.exists()) {
+                    setExecutablePermissions(carrier)
+                    carrierLoader?.let { setExecutablePermissions(it) }
+
+                    // Strategy A: Symlink bypass from files/linux/bin/proot to carrier library in nativeLibraryDir
+                    try {
+                        if (prootFile.exists()) prootFile.delete()
+                        android.system.Os.symlink(carrier.absolutePath, prootFile.absolutePath)
+                        testProotExecutable(prootFile)
+                        activeProotFile = prootFile
+                        activeLoaderFile = carrierLoader ?: loaderFile
+                        bypassSuccess = true
+                    } catch (symEx: Throwable) {
+                        // Strategy B: Direct carrier execution (SELinux unconditionally permits executing apk_data_file in nativeLibraryDir)
+                        try {
+                            testProotExecutable(carrier)
+                            activeProotFile = carrier
+                            activeLoaderFile = carrierLoader ?: loaderFile
+                            bypassSuccess = true
+                        } catch (directEx: Throwable) {
+                            // Direct carrier also failed
+                        }
+                    }
+                }
+
+                if (!bypassSuccess) {
+                    val diagMsg = "Cannot run program \"${activeProotFile.absolutePath}\": error=13, Permission denied (SELinux W^X execution restriction detected on app data directory and carrier fallback in nativeLibraryDir is unavailable or unexecutable)"
+                    throw IllegalStateException("PRoot execution failed in Stage 6 (PREPARING_PROOT): $diagMsg", e)
+                }
+            } else {
+                val diagMsg = "Cannot run program \"${activeProotFile.absolutePath}\": $errorMsg"
+                throw IllegalStateException("PRoot execution failed in Stage 6 (PREPARING_PROOT): $diagMsg", e)
+            }
         }
     }
 

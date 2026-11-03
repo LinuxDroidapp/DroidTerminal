@@ -37,12 +37,16 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
     override fun getRuntimeName(): String = "Ubuntu ARM64 (PRoot)"
 
     override fun getProotExecutable(): File {
-        if (prootFile.exists()) return prootFile
-        val nativeLibProot = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
-        if (nativeLibProot.exists()) return nativeLibProot
-        val legacy = File(context.filesDir, "bin/proot")
-        if (legacy.exists()) return legacy
-        return prootFile
+        return try {
+            RuntimeAssetsManager(context, linuxDir).resolveProot()
+        } catch (e: Throwable) {
+            val nativeLibProot = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
+            if (nativeLibProot.exists()) return nativeLibProot
+            if (prootFile.exists()) return prootFile
+            val legacy = File(context.filesDir, "bin/proot")
+            if (legacy.exists()) return legacy
+            prootFile
+        }
     }
 
     override fun getRootfsDirectory(): File {
