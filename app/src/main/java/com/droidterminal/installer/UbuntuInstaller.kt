@@ -355,9 +355,9 @@ class UbuntuInstaller(
                 updateState(InstallStage.CONFIGURING_ENVIRONMENT, "Configuring DNS resolvers (1.1.1.1, 8.8.8.8) and shared memory...", -1f)
                 configureDnsAndNetwork()
 
-                // Stage 9: Staged Verification (5 Stages)
-                updateState(InstallStage.VERIFYING_INSTALLATION, "Verifying PRoot runtime, shell execution, and interactive PTY...", -1f)
-                verifyLinuxInstallation()
+                // Stage 9: Staged Verification (6 Stages including Pre-Upgrade Health Check)
+                updateState(InstallStage.VERIFYING_INSTALLATION, "Verifying PRoot runtime, shell execution, coreutils & pre-upgrade health...", -1f)
+                verifyLinuxInstallation(archiveFile)
 
                 // Stage 10: Complete and persist manifest
                 writeEnvironmentManifest()
@@ -816,6 +816,46 @@ class UbuntuInstaller(
         setStickyPermissions(File(rootfsDir, "var/tmp"))
         setStickyPermissions(File(rootfsDir, "dev/shm"))
 
+        // Guarantee canonical PATH across dpkg maintainer scripts via /etc/environment, /etc/profile, and /etc/login.defs
+        val etcDir = File(rootfsDir, "etc")
+        if (!etcDir.exists()) etcDir.mkdirs()
+        val envFile = File(etcDir, "environment")
+        if (!envFile.exists() || !envFile.readText().contains("PATH=")) {
+            envFile.writeText("PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n")
+        }
+
+        val profileFile = File(etcDir, "profile")
+        if (!profileFile.exists()) {
+            profileFile.writeText(
+                """
+                # /etc/profile: system-wide .profile file for the Bourne shell (sh(1))
+                # and Bourne compatible shells (bash(1), ksh(1), ash(1), ...).
+                if [ "${'$'}PS1" ]; then
+                  if [ "${'$'}BASH" ] && [ "${'$'}BASH" != "/bin/sh" ]; then
+                    if [ -f /etc/bash.bashrc ]; then
+                      . /etc/bash.bashrc
+                    fi
+                  else
+                    if [ "`id -u`" -eq 0 ]; then
+                      PS1='# '
+                    else
+                      PS1='${'$'} '
+                    fi
+                  fi
+                fi
+
+                export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${'$'}PATH"
+                """.trimIndent() + "\n"
+            )
+        }
+
+        val loginDefs = File(etcDir, "login.defs")
+        if (!loginDefs.exists() || !loginDefs.readText().contains("ENV_SUPATH")) {
+            loginDefs.appendText(
+                "\nENV_SUPATH PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nENV_PATH PATH=/usr/local/bin:/usr/bin:/bin\n"
+            )
+        }
+
         // Problem B: Verify and repair UsrMerge symlinks (bin -> usr/bin, sbin -> usr/sbin, lib -> usr/lib, lib64 -> usr/lib64)
         val symlinkPairs = listOf(
             "bin" to "usr/bin",
@@ -855,16 +895,28 @@ class UbuntuInstaller(
         if (!libLd.exists() && primaryLinker != null) {
             try {
                 libLd.parentFile?.mkdirs()
-                android.system.Os.symlink(primaryLinker!!.absolutePath, libLd.absolutePath)
+                android.system.Os.symlink(primaryLinker.absolutePath, libLd.absolutePath)
                 setExecutablePermissions(libLd)
             } catch (_: Throwable) {}
         }
 
-        // Problem B: Ensure guest shell executables have 0755
+        // Problem B & libc6 requirement: Ensure guest shell and essential coreutils executables have 0755
         listOf(
             "usr/bin/bash", "bin/bash",
             "usr/bin/sh", "bin/sh",
-            "usr/bin/true", "bin/true"
+            "usr/bin/true", "bin/true",
+            "usr/bin/uname", "bin/uname",
+            "usr/bin/env", "bin/env",
+            "usr/bin/echo", "bin/echo",
+            "usr/bin/cat", "bin/cat",
+            "usr/bin/ls", "bin/ls",
+            "usr/bin/cp", "bin/cp",
+            "usr/bin/mv", "bin/mv",
+            "usr/bin/rm", "bin/rm",
+            "usr/bin/mkdir", "bin/mkdir",
+            "usr/bin/chmod", "bin/chmod",
+            "usr/bin/touch", "bin/touch",
+            "usr/bin/test", "bin/test"
         ).forEach { relPath ->
             val f = File(rootfsDir, relPath)
             if (f.exists()) setExecutablePermissions(f)
@@ -1123,14 +1175,59 @@ class UbuntuInstaller(
     }
 
     /**
-     * Executes the complete 5-Stage Verification Pipeline.
+     * Stage F: Pre-Upgrade Health Check.
+     * Verifies guest uname, Bash, sh, coreutils, dynamic linker, and dpkg integrity inside PRoot.
      */
-    fun verifyLinuxInstallation() {
+    fun verifyStageFPreUpgradeHealthCheck(archiveFile: File? = null): Boolean {
+        val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
+        val loader = activeLoaderFile ?: assetsManager.resolveLoader()
+
+        var result = PreUpgradeHealthCheck.checkRootfsHealth(rootfsDir, proot, loader, tmpDir)
+        if (!result.isHealthy) {
+            // Attempt safe, non-destructive recovery
+            val recovered = PreUpgradeHealthCheck.safeRecoverCoreutils(rootfsDir, archiveFile)
+            result = PreUpgradeHealthCheck.checkRootfsHealth(rootfsDir, proot, loader, tmpDir)
+            if (!result.isHealthy) {
+                val failures = result.checks.filterValues { !it }.keys.joinToString(", ")
+                throw IllegalStateException("Stage F Failed: Pre-upgrade health check failed for: $failures. Details: ${result.details}")
+            }
+        }
+        return true
+    }
+
+    /**
+     * Executes the complete 6-Stage Verification Pipeline.
+     */
+    fun verifyLinuxInstallation(archiveFile: File? = null) {
         verifyStageAHostRuntime()
         verifyStageBRootfsStructure()
         verifyStageCProotStartup()
         verifyStageDShellExecution()
         verifyStageEInteractivePty()
+        verifyStageFPreUpgradeHealthCheck(archiveFile)
+    }
+
+    /**
+     * Standalone entry point to run pre-upgrade health check and safe recovery.
+     */
+    fun runPreUpgradeHealthCheckAndRepair(archiveFile: File? = null): HealthCheckResult {
+        val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
+        val loader = activeLoaderFile ?: assetsManager.resolveLoader()
+        var result = PreUpgradeHealthCheck.checkRootfsHealth(rootfsDir, proot, loader, tmpDir)
+        if (!result.isHealthy) {
+            PreUpgradeHealthCheck.safeRecoverCoreutils(rootfsDir, archiveFile)
+            result = PreUpgradeHealthCheck.checkRootfsHealth(rootfsDir, proot, loader, tmpDir)
+        }
+        return result
+    }
+
+    /**
+     * Retries pending dpkg packages only after pre-upgrade health check passes.
+     */
+    fun retryDpkgPackageConfiguration(archiveFile: File? = null): Pair<Int, String> {
+        val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
+        val loader = activeLoaderFile ?: assetsManager.resolveLoader()
+        return PreUpgradeHealthCheck.retryPackageConfiguration(rootfsDir, proot, loader, tmpDir, archiveFile)
     }
 
     private fun writeEnvironmentManifest() {

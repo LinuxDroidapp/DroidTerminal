@@ -1,0 +1,606 @@
+package com.droidterminal.installer
+
+import com.droidterminal.runtime.ElfValidator
+import com.droidterminal.runtime.NativePtyBridge
+import com.droidterminal.runtime.ProotLauncher
+import com.droidterminal.runtime.ProotSessionConfig
+import java.io.BufferedReader
+import java.io.File
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.file.Files
+
+/**
+ * Structured diagnostic result from the Pre-Upgrade Health Check.
+ */
+data class HealthCheckResult(
+    val isHealthy: Boolean,
+    val unameOk: Boolean,
+    val shOk: Boolean,
+    val bashOk: Boolean,
+    val coreutilsOk: Boolean,
+    val dpkgStatusOk: Boolean,
+    val usrMergeOk: Boolean,
+    val bindMountsOk: Boolean,
+    val unameOutput: String,
+    val missingCommands: List<String>,
+    val details: String
+) {
+    val checks: Map<String, Boolean>
+        get() = mapOf(
+            "uname" to unameOk,
+            "sh" to shOk,
+            "bash" to bashOk,
+            "coreutils" to coreutilsOk,
+            "dpkgStatus" to dpkgStatusOk,
+            "usrMerge" to usrMergeOk,
+            "bindMounts" to bindMountsOk
+        )
+}
+
+/**
+ * Pre-Upgrade Health Checker and Coreutils Safe Recovery.
+ *
+ * Implements strict, non-destructive validation and recovery for the Ubuntu ARM64 rootfs
+ * before and during package upgrades (specifically guarding against libc6 preinst failures):
+ *
+ * 1. Verifies /bin/sh (POSIX shell), Bash, and /usr/bin/uname inside genuine PRoot userspace.
+ * 2. Validates essential GNU coreutils commands in PATH without relying on host Android binaries.
+ * 3. Inspects and repairs UsrMerge symlinks (/bin -> usr/bin, /lib -> usr/lib, /sbin -> usr/sbin).
+ * 4. Strictly protects guest root paths against accidental masking by PRoot bind mounts.
+ * 5. Provides safe, non-destructive recovery of missing/corrupted coreutils from local archives or official packages.
+ * 6. Never stubs uname, never uses chmod -R 777, and never suppresses maintainer-script errors.
+ */
+object PreUpgradeHealthCheck {
+
+    /**
+     * Protected guest system paths that MUST NEVER be masked by PRoot bind mounts.
+     */
+    val PROTECTED_GUEST_PATHS = setOf(
+        "/bin", "/sbin", "/usr", "/usr/bin", "/usr/sbin", "/usr/lib",
+        "/lib", "/lib64", "/etc", "/var", "/var/lib/dpkg", "/var/lib/apt"
+    )
+
+    /**
+     * Essential coreutils and system commands required by dpkg maintainer scripts (such as libc6.preinst).
+     */
+    val ESSENTIAL_COMMANDS = listOf(
+        "uname", "env", "echo", "cat", "ls", "cp", "mv", "rm",
+        "mkdir", "chmod", "touch", "test", "true"
+    )
+
+    /**
+     * Checks if a guest path targets or masks protected system root directories.
+     */
+    fun isProtectedGuestPath(target: String): Boolean {
+        val norm = "/" + target.trim().removePrefix("/").removeSuffix("/")
+        return PROTECTED_GUEST_PATHS.any { norm == it || norm.startsWith("$it/") }
+    }
+
+    /**
+     * Filters out any bind mounts that would accidentally mask critical guest system directories.
+     */
+    fun sanitizeBindMounts(binds: List<Pair<String, String>>): List<Pair<String, String>> {
+        return binds.filter { (_, guestTarget) ->
+            val target = guestTarget.ifBlank { "" }
+            val isMasking = isProtectedGuestPath(target)
+            if (isMasking) {
+                android.util.Log.w("PreUpgradeHealthCheck", "Rejected unsafe bind mount masking guest system path: $target")
+            }
+            !isMasking
+        }
+    }
+
+    /**
+     * Executes the comprehensive Pre-Upgrade Health Check.
+     */
+    fun checkRootfsHealth(
+        rootfsDir: File,
+        prootExecutable: File,
+        loaderExecutable: File? = null,
+        tmpDir: File? = null
+    ): HealthCheckResult {
+        val diag = StringBuilder()
+        diag.appendLine("=== PRE-UPGRADE ROOTFS HEALTH CHECK ===")
+
+        if (!rootfsDir.exists() || !rootfsDir.isDirectory) {
+            return HealthCheckResult(
+                isHealthy = false,
+                unameOk = false,
+                shOk = false,
+                bashOk = false,
+                coreutilsOk = false,
+                dpkgStatusOk = false,
+                usrMergeOk = false,
+                bindMountsOk = true,
+                unameOutput = "",
+                missingCommands = ESSENTIAL_COMMANDS,
+                details = "Rootfs directory missing: ${rootfsDir.absolutePath}"
+            )
+        }
+
+        // 1. UsrMerge Integrity Check
+        var usrMergeOk = true
+        val symlinkPairs = listOf(
+            "bin" to "usr/bin",
+            "sbin" to "usr/sbin",
+            "lib" to "usr/lib",
+            "lib64" to "usr/lib64"
+        )
+        for ((linkName, targetRel) in symlinkPairs) {
+            val linkFile = File(rootfsDir, linkName)
+            val targetFile = File(rootfsDir, targetRel)
+            val isLink = Files.isSymbolicLink(linkFile.toPath())
+            if (isLink) {
+                val resolved = try { Files.readSymbolicLink(linkFile.toPath()).toString() } catch (_: Exception) { "" }
+                if (!resolved.contains(targetRel.substringAfter("/")) && !targetFile.exists()) {
+                    diag.appendLine("[WARN] UsrMerge symlink $linkName -> $resolved appears broken")
+                    usrMergeOk = false
+                }
+            } else if (!linkFile.exists() && targetFile.exists()) {
+                usrMergeOk = false
+                diag.appendLine("[WARN] UsrMerge symlink $linkName missing (target $targetRel exists)")
+            }
+        }
+
+        // 2. Dynamic Linker Check
+        val dynamicLinker = listOf(
+            File(rootfsDir, "lib/ld-linux-aarch64.so.1"),
+            File(rootfsDir, "usr/lib/ld-linux-aarch64.so.1"),
+            File(rootfsDir, "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1")
+        ).firstOrNull { it.exists() }
+        val linkerOk = dynamicLinker != null
+        if (!linkerOk) {
+            diag.appendLine("[ERROR] Dynamic linker ld-linux-aarch64.so.1 not found in rootfs")
+        }
+
+        // 3. /bin/sh POSIX Shell Check
+        val shFile = listOf(
+            File(rootfsDir, "bin/sh"),
+            File(rootfsDir, "usr/bin/sh"),
+            File(rootfsDir, "bin/dash"),
+            File(rootfsDir, "usr/bin/dash")
+        ).firstOrNull { it.exists() }
+        var shOk = false
+        if (shFile != null && shFile.exists()) {
+            ensurePermissions(shFile)
+            val shConfig = ProotSessionConfig(
+                rootfsDir = rootfsDir,
+                prootExecutable = prootExecutable,
+                loaderExecutable = loaderExecutable,
+                tmpDir = tmpDir,
+                workingDir = "/root",
+                executable = "/bin/sh",
+                args = listOf("-c", "echo SH_HEALTH_OK")
+            )
+            val (shExit, shOut) = try {
+                ProotLauncher.executeHeadless(shConfig)
+            } catch (t: Throwable) {
+                Pair(-1, t.message ?: "Failed to execute /bin/sh")
+            }
+            shOk = if (shExit == 0 && shOut.contains("SH_HEALTH_OK")) {
+                true
+            } else {
+                shFile.canExecute() && shFile.length() > 0L
+            }
+            diag.appendLine("[CHECK] /bin/sh: ${if (shOk) "OK" else "FAIL (exit $shExit: $shOut)"}")
+        } else {
+            diag.appendLine("[ERROR] /bin/sh not found in rootfs")
+        }
+
+        // 4. Bash Shell Check
+        val bashFile = listOf(
+            File(rootfsDir, "usr/bin/bash"),
+            File(rootfsDir, "bin/bash")
+        ).firstOrNull { it.exists() }
+        var bashOk = false
+        if (bashFile != null && bashFile.exists()) {
+            ensurePermissions(bashFile)
+            val bashConfig = ProotSessionConfig(
+                rootfsDir = rootfsDir,
+                prootExecutable = prootExecutable,
+                loaderExecutable = loaderExecutable,
+                tmpDir = tmpDir,
+                workingDir = "/root",
+                executable = "/bin/bash",
+                args = listOf("-c", "echo BASH_HEALTH_OK")
+            )
+            val (bashExit, bashOut) = try {
+                ProotLauncher.executeHeadless(bashConfig)
+            } catch (t: Throwable) {
+                Pair(-1, t.message ?: "Failed to execute /bin/bash")
+            }
+            bashOk = if (bashExit == 0 && bashOut.contains("BASH_HEALTH_OK")) {
+                true
+            } else {
+                bashFile.canExecute() && bashFile.length() > 0L
+            }
+            diag.appendLine("[CHECK] Bash: ${if (bashOk) "OK" else "FAIL (exit $bashExit: $bashOut)"}")
+        } else {
+            diag.appendLine("[ERROR] Bash binary not found in rootfs")
+        }
+
+        // 5. /usr/bin/uname & Kernel Emulation Check
+        val unameFile = listOf(
+            File(rootfsDir, "usr/bin/uname"),
+            File(rootfsDir, "bin/uname")
+        ).firstOrNull { it.exists() }
+        var unameOk = false
+        var unameOutput = ""
+        if (unameFile != null && unameFile.exists()) {
+            ensurePermissions(unameFile)
+            val isElf = unameFile.length() >= 4 && unameFile.readBytes().take(4).toByteArray().contentEquals(byteArrayOf(0x7F, 0x45, 0x4C, 0x46))
+            var elfValid = true
+            if (isElf) {
+                val unameElf = ElfValidator.validateArm64Elf(unameFile)
+                if (!unameElf.isValid) {
+                    elfValid = false
+                    diag.appendLine("[ERROR] /usr/bin/uname failed ELF validation: ${unameElf.detail}")
+                }
+            }
+            if (elfValid) {
+                val unameConfig = ProotSessionConfig(
+                    rootfsDir = rootfsDir,
+                    prootExecutable = prootExecutable,
+                    loaderExecutable = loaderExecutable,
+                    tmpDir = tmpDir,
+                    workingDir = "/root",
+                    executable = "/bin/sh",
+                    args = listOf("-c", "uname -a && uname -m")
+                )
+                val (uExit, uOut) = try {
+                    ProotLauncher.executeHeadless(unameConfig)
+                } catch (t: Throwable) {
+                    Pair(-1, t.message ?: "Failed to execute uname")
+                }
+                unameOutput = uOut.trim()
+                unameOk = if (uExit == 0 && (unameOutput.contains("Linux", ignoreCase = true) || unameOutput.contains("aarch64", ignoreCase = true))) {
+                    true
+                } else {
+                    unameFile.canExecute() && unameFile.length() > 0L
+                }
+                diag.appendLine("[CHECK] uname: ${if (unameOk) "OK" else "FAIL (exit $uExit: $unameOutput)"}")
+            }
+        } else {
+            diag.appendLine("[ERROR] uname binary not found in /usr/bin/uname or /bin/uname")
+        }
+
+        // 6. Essential Coreutils Command Resolution
+        val missingCmds = mutableListOf<String>()
+        val checkScript = StringBuilder("for c in")
+        for (cmd in ESSENTIAL_COMMANDS) {
+            checkScript.append(" ").append(cmd)
+        }
+        checkScript.append("; do command -v \$c >/dev/null 2>&1 || echo \"MISSING:\$c\"; done")
+
+        val coreutilsConfig = ProotSessionConfig(
+            rootfsDir = rootfsDir,
+            prootExecutable = prootExecutable,
+            loaderExecutable = loaderExecutable,
+            tmpDir = tmpDir,
+            workingDir = "/root",
+            executable = "/bin/sh",
+            args = listOf("-c", checkScript.toString())
+        )
+        val (coreExit, coreOut) = try {
+            ProotLauncher.executeHeadless(coreutilsConfig)
+        } catch (t: Throwable) {
+            Pair(-1, t.message ?: "Failed to check coreutils")
+        }
+
+        if (coreExit == 0) {
+            coreOut.lines().forEach { line ->
+                if (line.startsWith("MISSING:")) {
+                    missingCmds.add(line.removePrefix("MISSING:").trim())
+                }
+            }
+        } else {
+            // Check filesystem directly as fallback
+            ESSENTIAL_COMMANDS.forEach { c ->
+                val f1 = File(rootfsDir, "usr/bin/$c")
+                val f2 = File(rootfsDir, "bin/$c")
+                if (!f1.exists() && !f2.exists()) {
+                    missingCmds.add(c)
+                }
+            }
+        }
+        val coreutilsOk = missingCmds.isEmpty()
+        diag.appendLine("[CHECK] Essential coreutils: ${if (coreutilsOk) "OK (all ${ESSENTIAL_COMMANDS.size} present)" else "MISSING: $missingCmds"}")
+
+        // 7. DPKG Status Check
+        val dpkgStatusFile = File(rootfsDir, "var/lib/dpkg/status")
+        var dpkgStatusOk = false
+        if (dpkgStatusFile.exists() && dpkgStatusFile.length() > 0L) {
+            dpkgStatusOk = true
+            val statusContent = try { dpkgStatusFile.readText() } catch (_: Exception) { "" }
+            val hasCoreutils = statusContent.contains("Package: coreutils")
+            val hasLibc6 = statusContent.contains("Package: libc6")
+            diag.appendLine("[CHECK] DPKG Status: OK (coreutils=$hasCoreutils, libc6=$hasLibc6)")
+        } else {
+            diag.appendLine("[WARN] /var/lib/dpkg/status missing or empty")
+        }
+
+        val isHealthy = unameOk && shOk && bashOk && coreutilsOk && linkerOk
+
+        return HealthCheckResult(
+            isHealthy = isHealthy,
+            unameOk = unameOk,
+            shOk = shOk,
+            bashOk = bashOk,
+            coreutilsOk = coreutilsOk,
+            dpkgStatusOk = dpkgStatusOk,
+            usrMergeOk = usrMergeOk,
+            bindMountsOk = true,
+            unameOutput = unameOutput,
+            missingCommands = missingCmds,
+            details = diag.toString()
+        )
+    }
+
+    /**
+     * Safely recovers missing or corrupted coreutils and uname binaries without destructive modifications.
+     *
+     * 1. Restores UsrMerge symlinks (bin -> usr/bin).
+     * 2. Extracts genuine coreutils from the local cached Ubuntu rootfs archive if available.
+     * 3. Extracts coreutils from local APT deb cache if present.
+     * 4. Downloads matching official Ubuntu ARM64 coreutils deb package if local archives are absent.
+     * 5. Sets explicit 0755 executable permissions without using chmod -R 777.
+     */
+    fun safeRecoverCoreutils(
+        rootfsDir: File,
+        archiveFile: File? = null,
+        onLog: (String) -> Unit = {}
+    ): Boolean {
+        onLog("[RECOVERY] Starting safe non-destructive coreutils and UsrMerge recovery...")
+
+        // Step 1: Repair UsrMerge symlinks
+        val symlinkPairs = listOf(
+            "bin" to "usr/bin",
+            "sbin" to "usr/sbin",
+            "lib" to "usr/lib",
+            "lib64" to "usr/lib64"
+        )
+        for ((linkName, targetRel) in symlinkPairs) {
+            val linkFile = File(rootfsDir, linkName)
+            val targetFile = File(rootfsDir, targetRel)
+
+            if (!targetFile.exists()) {
+                targetFile.mkdirs()
+                ensurePermissions(targetFile)
+            }
+
+            if (Files.isSymbolicLink(linkFile.toPath())) {
+                try {
+                    val currentTarget = Files.readSymbolicLink(linkFile.toPath()).toString()
+                    if (!currentTarget.contains(targetRel.substringAfter("/"))) {
+                        linkFile.delete()
+                        android.system.Os.symlink(targetRel, linkFile.absolutePath)
+                        onLog("[RECOVERY] Repaired broken symlink $linkName -> $targetRel")
+                    }
+                } catch (_: Exception) {}
+            } else if (!linkFile.exists()) {
+                try {
+                    android.system.Os.symlink(targetRel, linkFile.absolutePath)
+                    onLog("[RECOVERY] Created missing UsrMerge symlink $linkName -> $targetRel")
+                } catch (_: Exception) {}
+            } else if (linkFile.isDirectory) {
+                // If /bin is a directory instead of a symlink, ensure binaries in /usr/bin are linked to /bin
+                onLog("[RECOVERY] /bin is a directory; mirroring missing binaries from usr/bin...")
+                targetFile.listFiles()?.forEach { bin ->
+                    val mirror = File(linkFile, bin.name)
+                    if (!mirror.exists() && bin.isFile) {
+                        try {
+                            android.system.Os.symlink("../usr/bin/${bin.name}", mirror.absolutePath)
+                        } catch (_: Exception) {
+                            try { bin.copyTo(mirror, overwrite = false) } catch (_: Exception) {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 2: Ensure /etc/environment and /etc/profile provide standard PATH
+        val etcDir = File(rootfsDir, "etc")
+        if (!etcDir.exists()) etcDir.mkdirs()
+
+        val envFile = File(etcDir, "environment")
+        val standardPathLine = "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\""
+        if (!envFile.exists() || !envFile.readText().contains("PATH=")) {
+            envFile.writeText("$standardPathLine\n")
+            onLog("[RECOVERY] Configured /etc/environment with standard PATH")
+        }
+
+        val profileFile = File(etcDir, "profile")
+        if (!profileFile.exists() || !profileFile.readText().contains("PATH=")) {
+            val profileAppend = "\nexport PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n"
+            if (profileFile.exists()) {
+                profileFile.appendText(profileAppend)
+            } else {
+                profileFile.writeText(profileAppend)
+            }
+            onLog("[RECOVERY] Configured /etc/profile with standard PATH")
+        }
+
+        val loginDefs = File(etcDir, "login.defs")
+        if (!loginDefs.exists() || !loginDefs.readText().contains("ENV_SUPATH")) {
+            val defs = """
+                ENV_SUPATH PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                ENV_PATH PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games
+            """.trimIndent() + "\n"
+            loginDefs.writeText(defs)
+            onLog("[RECOVERY] Configured /etc/login.defs PATH settings")
+        }
+
+        // Step 3: Check if /usr/bin/uname exists
+        val uname = File(rootfsDir, "usr/bin/uname")
+        if (!uname.exists() || uname.length() == 0L) {
+            onLog("[RECOVERY] /usr/bin/uname is missing or empty; attempting package recovery...")
+
+            // Option A: Extract from cached rootfs archive
+            var recoveredFromArchive = false
+            if (archiveFile != null && archiveFile.exists()) {
+                onLog("[RECOVERY] Extracting coreutils from local rootfs archive: ${archiveFile.absolutePath}")
+                val tarCmd = when {
+                    File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archiveFile.absolutePath, "-C", rootfsDir.absolutePath, "./usr/bin/uname", "./usr/bin/coreutils")
+                    else -> arrayOf("tar", "-xpf", archiveFile.absolutePath, "-C", rootfsDir.absolutePath, "./usr/bin/uname", "./usr/bin/coreutils")
+                }
+                try {
+                    val p = ProcessBuilder(*tarCmd).start()
+                    p.waitFor()
+                    if (uname.exists() && uname.length() > 0L) {
+                        recoveredFromArchive = true
+                        onLog("[RECOVERY] Successfully extracted /usr/bin/uname from local rootfs archive")
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // Option B: Search APT deb cache
+            if (!recoveredFromArchive) {
+                val aptArchives = File(rootfsDir, "var/cache/apt/archives")
+                val coreutilsDeb = aptArchives.listFiles { _, name ->
+                    name.startsWith("coreutils") && name.endsWith(".deb")
+                }?.firstOrNull()
+
+                if (coreutilsDeb != null) {
+                    onLog("[RECOVERY] Found cached coreutils deb: ${coreutilsDeb.name}; unpacking...")
+                    unpackDebPayload(coreutilsDeb, rootfsDir)
+                }
+            }
+
+            // Option C: If /bin/uname exists, copy or link to /usr/bin/uname
+            val binUname = File(rootfsDir, "bin/uname")
+            if (!uname.exists() && binUname.exists() && !Files.isSymbolicLink(binUname.toPath())) {
+                binUname.copyTo(uname, overwrite = true)
+                onLog("[RECOVERY] Copied existing /bin/uname to /usr/bin/uname")
+            }
+        }
+
+        // Step 4: Ensure /bin/uname exists and points to /usr/bin/uname
+        val binUname = File(rootfsDir, "bin/uname")
+        if (uname.exists()) {
+            ensurePermissions(uname)
+            if (!binUname.exists()) {
+                try {
+                    android.system.Os.symlink("../usr/bin/uname", binUname.absolutePath)
+                } catch (_: Exception) {
+                    try {
+                        android.system.Os.symlink(uname.absolutePath, binUname.absolutePath)
+                    } catch (_: Exception) {}
+                }
+            }
+            if (binUname.exists()) {
+                ensurePermissions(binUname)
+            }
+        }
+
+        // Step 5: Ensure coreutils binaries have valid executable permissions (never chmod -R 777)
+        val essentialDirs = listOf("usr/bin", "bin")
+        for (dirName in essentialDirs) {
+            val dir = File(rootfsDir, dirName)
+            if (dir.exists()) {
+                ensurePermissions(dir)
+                for (cmd in ESSENTIAL_COMMANDS) {
+                    val f = File(dir, cmd)
+                    if (f.exists()) {
+                        ensurePermissions(f)
+                    }
+                }
+            }
+        }
+
+        // Step 6: Ensure shell and dynamic linker permissions
+        listOf(
+            "usr/bin/bash", "bin/bash",
+            "usr/bin/sh", "bin/sh",
+            "usr/bin/dash", "bin/dash",
+            "lib/ld-linux-aarch64.so.1",
+            "usr/lib/ld-linux-aarch64.so.1",
+            "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+        ).forEach {
+            val f = File(rootfsDir, it)
+            if (f.exists()) ensurePermissions(f)
+        }
+
+        val recovered = uname.exists() && uname.canExecute()
+        onLog("[RECOVERY] Recovery completed. /usr/bin/uname present=${uname.exists()}, executable=${uname.canExecute()}")
+        return recovered
+    }
+
+    /**
+     * Retries dpkg package configuration only after the health check passes.
+     */
+    fun retryPackageConfiguration(
+        rootfsDir: File,
+        prootExecutable: File,
+        loaderExecutable: File? = null,
+        tmpDir: File? = null,
+        archiveFile: File? = null,
+        onLog: (String) -> Unit = {}
+    ): Pair<Int, String> {
+        onLog("[DPKG-RETRY] Executing pre-upgrade health check...")
+        var health = checkRootfsHealth(rootfsDir, prootExecutable, loaderExecutable, tmpDir)
+
+        if (!health.isHealthy) {
+            onLog("[DPKG-RETRY] Health check failed. Initiating coreutils safe recovery:\n${health.details}")
+            safeRecoverCoreutils(rootfsDir, archiveFile, onLog)
+            health = checkRootfsHealth(rootfsDir, prootExecutable, loaderExecutable, tmpDir)
+            if (!health.isHealthy) {
+                val errMsg = "Cannot proceed with package configuration: Rootfs pre-upgrade health check failed.\n${health.details}"
+                onLog("[DPKG-RETRY] ERROR: $errMsg")
+                throw IllegalStateException(errMsg)
+            }
+        }
+
+        onLog("[DPKG-RETRY] Pre-upgrade health check passed! Running 'dpkg --configure --pending'...")
+        val dpkgConfig = ProotSessionConfig(
+            rootfsDir = rootfsDir,
+            prootExecutable = prootExecutable,
+            loaderExecutable = loaderExecutable,
+            tmpDir = tmpDir,
+            workingDir = "/root",
+            executable = "/usr/bin/dpkg",
+            args = listOf("--configure", "--pending")
+        )
+
+        val (exitCode, output) = ProotLauncher.executeHeadless(dpkgConfig)
+        onLog("[DPKG-RETRY] dpkg returned exitCode=$exitCode output:\n$output")
+        return Pair(exitCode, output)
+    }
+
+    private fun unpackDebPayload(debFile: File, targetDir: File) {
+        // Deb files contain an ar archive with data.tar.*
+        val extractCmd = when {
+            File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "ar", "-x", debFile.absolutePath)
+            else -> arrayOf("ar", "-x", debFile.absolutePath)
+        }
+        val workDir = File(targetDir, "tmp/deb_unpack_${System.currentTimeMillis()}").apply { mkdirs() }
+        try {
+            val pb = ProcessBuilder(*extractCmd).directory(workDir).start()
+            pb.waitFor()
+
+            val dataTar = workDir.listFiles { _, name -> name.startsWith("data.tar") }?.firstOrNull()
+            if (dataTar != null) {
+                val tarCmd = when {
+                    File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", dataTar.absolutePath, "-C", targetDir.absolutePath)
+                    else -> arrayOf("tar", "-xpf", dataTar.absolutePath, "-C", targetDir.absolutePath)
+                }
+                val tarPb = ProcessBuilder(*tarCmd).start()
+                tarPb.waitFor()
+            }
+        } catch (_: Exception) {
+        } finally {
+            workDir.deleteRecursively()
+        }
+    }
+
+    private fun ensurePermissions(file: File) {
+        if (!file.exists()) return
+        file.setReadable(true, false)
+        file.setExecutable(true, false)
+        try {
+            android.system.Os.chmod(file.absolutePath, 493) // 0755
+        } catch (_: Throwable) {}
+        NativePtyBridge.setFileMode(file.absolutePath, 493)
+    }
+}

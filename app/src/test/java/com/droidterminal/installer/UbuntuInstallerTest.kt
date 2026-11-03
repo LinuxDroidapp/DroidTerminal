@@ -632,4 +632,276 @@ class UbuntuInstallerTest {
         resolvedTmp2.deleteRecursively()
         assertTrue("Session 1 temporary files must remain alive during other session operations", session1File.exists())
     }
+
+    // =========================================================================
+    // LIBC6 PRE-INSTALLATION & PRE-UPGRADE HEALTH CHECK REGRESSION TESTS
+    // =========================================================================
+
+    /**
+     * Test A: PRoot bind mounts must NEVER accidentally mask /bin, /usr, /usr/bin, /lib, /etc.
+     */
+    @Test
+    fun testProtectedGuestBindMountsAreSanitized() {
+        val unsafeBinds = listOf(
+            "/host/android/bin" to "/bin",
+            "/host/android/usr" to "/usr",
+            "/host/android/usr_bin" to "/usr/bin",
+            "/host/android/lib" to "/lib",
+            "/host/android/etc" to "/etc",
+            "/host/android/dpkg" to "/var/lib/dpkg",
+            "/sdcard" to "/sdcard",
+            "/storage/emulated/0/Download" to "/root/Downloads"
+        )
+
+        // 1. Validate isProtectedGuestPath
+        assertTrue(PreUpgradeHealthCheck.isProtectedGuestPath("/bin"))
+        assertTrue(PreUpgradeHealthCheck.isProtectedGuestPath("/usr/bin"))
+        assertTrue(PreUpgradeHealthCheck.isProtectedGuestPath("/usr/sbin"))
+        assertTrue(PreUpgradeHealthCheck.isProtectedGuestPath("/lib"))
+        assertTrue(PreUpgradeHealthCheck.isProtectedGuestPath("/etc"))
+        assertTrue(PreUpgradeHealthCheck.isProtectedGuestPath("/var/lib/dpkg"))
+        assertFalse(PreUpgradeHealthCheck.isProtectedGuestPath("/sdcard"))
+        assertFalse(PreUpgradeHealthCheck.isProtectedGuestPath("/root/Downloads"))
+
+        // 2. Validate sanitizeBindMounts
+        val sanitized = PreUpgradeHealthCheck.sanitizeBindMounts(unsafeBinds)
+        assertEquals(2, sanitized.size)
+        assertEquals("/sdcard", sanitized[0].second)
+        assertEquals("/root/Downloads", sanitized[1].second)
+
+        // 3. Validate ProotLauncher.buildProotCommand drops unsafe bind mounts
+        val rootfsDir = tempFolder.newFolder("bind_test_rootfs")
+        val config = ProotSessionConfig(
+            rootfsDir = rootfsDir,
+            prootExecutable = assetProot,
+            customBinds = unsafeBinds
+        )
+        val command = ProotLauncher.buildProotCommand(config)
+        assertFalse("Command must not contain -b ...:/bin", command.contains("/bin") && command.any { it.contains(":/bin") })
+        assertFalse("Command must not contain -b ...:/usr", command.any { it.contains(":/usr") })
+        assertFalse("Command must not contain -b ...:/etc", command.any { it.contains(":/etc") })
+        assertTrue("Command must retain safe bind mount /sdcard", command.contains("/sdcard") || command.any { it.contains(":/sdcard") })
+        assertTrue("Command must retain safe bind mount /root/Downloads", command.any { it.contains(":/root/Downloads") })
+    }
+
+    /**
+     * Test B: Pre-upgrade health check detects missing uname and executes safe non-destructive recovery.
+     */
+    @Test
+    fun testPreUpgradeHealthCheckDetectsMissingUnameAndRecovers() {
+        val rootfsDir = tempFolder.newFolder("health_check_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val bin = File(rootfsDir, "bin").apply { mkdirs() }
+        val usrLib = File(rootfsDir, "usr/lib").apply { mkdirs() }
+        val etc = File(rootfsDir, "etc").apply { mkdirs() }
+
+        // Setup bash, sh, and essential coreutils EXCEPT uname
+        val bash = File(usrBin, "bash").apply {
+            writeText("#!/bin/sh\nexit 0\n")
+            setExecutable(true)
+        }
+        val sh = File(usrBin, "sh").apply {
+            writeText("#!/bin/sh\nexit 0\n")
+            setExecutable(true)
+        }
+        val linker = File(usrLib, "ld-linux-aarch64.so.1").apply {
+            writeText("MOCK-ELF-LINKER")
+            setExecutable(true)
+        }
+
+        for (cmd in PreUpgradeHealthCheck.ESSENTIAL_COMMANDS) {
+            if (cmd != "uname") {
+                File(usrBin, cmd).apply {
+                    writeText("#!/bin/sh\nexit 0\n")
+                    setExecutable(true)
+                }
+            }
+        }
+
+        // 1. Initial health check must FAIL because uname is missing
+        val initialHealth = PreUpgradeHealthCheck.checkRootfsHealth(
+            rootfsDir = rootfsDir,
+            prootExecutable = assetProot
+        )
+        assertFalse("Health check must report unhealthy when uname is missing", initialHealth.isHealthy)
+        assertFalse("unameOk must be false", initialHealth.unameOk)
+        assertTrue("missingCommands must include uname", initialHealth.missingCommands.contains("uname"))
+
+        // 2. Perform safe recovery: place genuine uname in mock archive or deb cache
+        val aptCache = File(rootfsDir, "var/cache/apt/archives").apply { mkdirs() }
+        // Create source /bin/uname that recovery can non-destructively promote/restore
+        val mockSourceUname = File(rootfsDir, "tmp/mock_uname").apply {
+            parentFile?.mkdirs()
+            writeText("#!/bin/sh\necho aarch64\n")
+            setExecutable(true)
+        }
+        val recoveredBinUname = File(bin, "uname")
+        mockSourceUname.copyTo(recoveredBinUname, overwrite = true)
+        recoveredBinUname.setExecutable(true)
+
+        val recoveryResult = PreUpgradeHealthCheck.safeRecoverCoreutils(rootfsDir)
+        assertTrue("safeRecoverCoreutils must succeed", recoveryResult)
+
+        // 3. Verify /usr/bin/uname exists, is executable, and UsrMerge symlinks exist
+        val usrUname = File(usrBin, "uname")
+        assertTrue("/usr/bin/uname must exist after recovery", usrUname.exists())
+        assertTrue("/usr/bin/uname must be executable", usrUname.canExecute())
+        assertTrue("bin/uname must exist", File(bin, "uname").exists())
+
+        // 4. Verify /etc/environment contains canonical PATH
+        val envFile = File(etc, "environment")
+        assertTrue("/etc/environment must exist", envFile.exists())
+        assertTrue(
+            "/etc/environment must specify canonical PATH",
+            envFile.readText().contains("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        )
+
+        // 5. Subsequent health check must PASS
+        val recheck = PreUpgradeHealthCheck.checkRootfsHealth(
+            rootfsDir = rootfsDir,
+            prootExecutable = assetProot
+        )
+        assertTrue("Health check must pass after safe recovery", recheck.isHealthy)
+        assertTrue("unameOk must be true", recheck.unameOk)
+        assertTrue("shOk must be true", recheck.shOk)
+        assertTrue("bashOk must be true", recheck.bashOk)
+        assertTrue("coreutilsOk must be true", recheck.coreutilsOk)
+    }
+
+    /**
+     * Test C: Dpkg maintainer scripts PATH guarantee across environment files.
+     */
+    @Test
+    fun testDpkgMaintainerScriptPathGuarantee() {
+        val freshFilesDir = tempFolder.newFolder("path_guarantee_files")
+        val installer = UbuntuInstaller(context = null, customFilesDir = freshFilesDir)
+        installer.linuxDir.mkdirs()
+        installer.rootfsDir.mkdirs()
+
+        // Invoke filesystem configuration
+        val configureMethod = UbuntuInstaller::class.java.getDeclaredMethod("configureLinuxFilesystem")
+        configureMethod.isAccessible = true
+        configureMethod.invoke(installer)
+
+        val etcDir = File(installer.rootfsDir, "etc")
+        val envFile = File(etcDir, "environment")
+        val profileFile = File(etcDir, "profile")
+        val loginDefs = File(etcDir, "login.defs")
+
+        assertTrue("/etc/environment must exist", envFile.exists())
+        assertTrue(
+            "/etc/environment must define canonical PATH",
+            envFile.readText().contains("PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"")
+        )
+
+        assertTrue("/etc/profile must exist", profileFile.exists())
+        assertTrue(
+            "/etc/profile must export canonical PATH",
+            profileFile.readText().contains("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        )
+
+        assertTrue("/etc/login.defs must exist", loginDefs.exists())
+        assertTrue(
+            "/etc/login.defs must configure ENV_SUPATH",
+            loginDefs.readText().contains("ENV_SUPATH PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        )
+    }
+
+    /**
+     * Test D: Simulated libc6.preinst execution succeeds when uname is resolved and fails with 127 when absent.
+     */
+    @Test
+    fun testRealLibc6PreinstSimulationInsideProot() {
+        val rootfsDir = tempFolder.newFolder("libc6_test_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val bin = File(rootfsDir, "bin").apply { mkdirs() }
+        val tmp = File(rootfsDir, "tmp").apply { mkdirs() }
+
+        // Create libc6.preinst mock script that behaves like Debian/Ubuntu libc6.preinst:
+        // executes `uname -m` under /bin/sh
+        val preinstScript = File(tmp, "libc6.preinst").apply {
+            writeText(
+                """
+                #!/bin/sh
+                set -e
+                # libc6 maintainer script checks kernel version via uname -m
+                arch=${'$'}(uname -m)
+                if [ -z "${'$'}arch" ]; then
+                    echo "libc6.preinst: uname returned empty" >&2
+                    exit 1
+                fi
+                echo "libc6:arm64 preinst validated architecture: ${'$'}arch"
+                exit 0
+                """.trimIndent() + "\n"
+            )
+            setExecutable(true)
+        }
+
+        // 1. Without uname in PATH / usr/bin / bin:
+        // Running libc6.preinst directly in a shell process without uname will exit 127
+        val isolatedEnv = arrayOf("PATH=/usr/bin:/bin")
+        val failedProcess = ProcessBuilder("/bin/sh", preinstScript.absolutePath)
+            .directory(tmp)
+        failedProcess.environment().clear()
+        failedProcess.environment()["PATH"] = usrBin.absolutePath // usrBin currently has NO uname!
+
+        val failedProc = failedProcess.start()
+        val exitCode = failedProc.waitFor()
+        assertNotEquals("Script must fail without uname in PATH", 0, exitCode)
+
+        // 2. Add genuine uname into usr/bin
+        val unameFile = File(usrBin, "uname").apply {
+            writeText(
+                """
+                #!/bin/sh
+                if [ "${'$'}1" = "-m" ]; then
+                    echo "aarch64"
+                elif [ "${'$'}1" = "-a" ]; then
+                    echo "Linux ubuntu 5.15.0-generic aarch64 GNU/Linux"
+                else
+                    echo "Linux"
+                fi
+                exit 0
+                """.trimIndent() + "\n"
+            )
+            setExecutable(true)
+        }
+
+        // 3. Now re-run libc6.preinst with uname available:
+        val successProcess = ProcessBuilder("/bin/sh", preinstScript.absolutePath)
+            .directory(tmp)
+        successProcess.environment().clear()
+        successProcess.environment()["PATH"] = usrBin.absolutePath
+
+        val successProc = successProcess.start()
+        val successExit = successProc.waitFor()
+        val successOutput = successProc.inputStream.bufferedReader().readText()
+
+        assertEquals("libc6.preinst must exit 0 when uname is present", 0, successExit)
+        assertTrue(
+            "Output must confirm validated architecture",
+            successOutput.contains("libc6:arm64 preinst validated architecture: aarch64")
+        )
+    }
+
+    /**
+     * Test E: Dpkg package configuration retry lifecycle only executes when pre-upgrade health check passes.
+     */
+    @Test
+    fun testRetryPackageConfigurationLifecycle() {
+        val rootfsDir = tempFolder.newFolder("retry_lifecycle_rootfs")
+
+        // 1. When rootfs is completely empty/broken, retryPackageConfiguration must throw IllegalStateException
+        var rejected = false
+        try {
+            PreUpgradeHealthCheck.retryPackageConfiguration(
+                rootfsDir = rootfsDir,
+                prootExecutable = assetProot
+            )
+        } catch (e: IllegalStateException) {
+            rejected = true
+            assertTrue(e.message?.contains("Rootfs pre-upgrade health check failed") == true)
+        }
+        assertTrue("Package configuration retry must be blocked on failing health check", rejected)
+    }
 }

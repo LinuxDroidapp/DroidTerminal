@@ -33,6 +33,20 @@ size_t SessionRegistry::getActiveSessionCount() {
     return sessions_.size();
 }
 
+static bool isProtectedGuestPath(const std::string& target) {
+    std::string norm = target;
+    while (!norm.empty() && norm.back() == '/') norm.pop_back();
+    if (norm.empty() || norm.front() != '/') norm = "/" + norm;
+    static const std::vector<std::string> protectedRoots = {
+        "/bin", "/sbin", "/usr", "/usr/bin", "/usr/sbin", "/usr/lib",
+        "/lib", "/lib64", "/etc", "/var", "/var/lib/dpkg", "/var/lib/apt"
+    };
+    for (const auto& p : protectedRoots) {
+        if (norm == p || norm.rfind(p + "/", 0) == 0) return true;
+    }
+    return false;
+}
+
 int spawnPtyProcess(const SessionConfig& config, std::shared_ptr<TerminalSessionInstance>& outSession) {
     int masterFd = -1;
     struct winsize ws;
@@ -166,6 +180,11 @@ int spawnPtyProcess(const SessionConfig& config, std::shared_ptr<TerminalSession
             argStrings.push_back("/sys");
 
             for (const auto& bind : config.bindMounts) {
+                std::string target = bind.second.empty() ? bind.first : bind.second;
+                if (isProtectedGuestPath(target)) {
+                    LOGW("Rejected unsafe bind mount masking guest system path: %s", target.c_str());
+                    continue;
+                }
                 argStrings.push_back("-b");
                 if (bind.second.empty() || bind.first == bind.second) {
                     argStrings.push_back(bind.first);

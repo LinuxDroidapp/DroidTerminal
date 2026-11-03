@@ -249,8 +249,9 @@ object ProotLauncher {
             add("-b")
             add("${shmBacking.canonicalFile.absolutePath}:/dev/shm")
 
-            // Custom user or runtime bindings
-            for (bind in config.customBinds) {
+            // Custom user or runtime bindings (strictly sanitized to prevent masking /bin, /usr, /lib)
+            val safeBinds = com.droidterminal.installer.PreUpgradeHealthCheck.sanitizeBindMounts(config.customBinds)
+            for (bind in safeBinds) {
                 add("-b")
                 if (bind.second.isBlank() || bind.first == bind.second) {
                     add(bind.first)
@@ -346,7 +347,7 @@ object ProotLauncher {
         }
         val allBinds = mutableListOf<Pair<String, String>>()
         allBinds.add(shmBacking.canonicalFile.absolutePath to "/dev/shm")
-        allBinds.addAll(config.customBinds)
+        allBinds.addAll(com.droidterminal.installer.PreUpgradeHealthCheck.sanitizeBindMounts(config.customBinds))
 
         val bindSrcs = allBinds.map { it.first }.toTypedArray()
         val bindTgts = allBinds.map { it.second }.toTypedArray()
