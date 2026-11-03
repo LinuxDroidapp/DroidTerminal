@@ -531,4 +531,105 @@ class UbuntuInstallerTest {
         val probeOutput = installer.testProotExecutable(installer.activeProotFile)
         assertTrue("Probe output must confirm PRoot execution", probeOutput.contains("5.1."))
     }
+
+    @Test
+    fun testProblemAGuestWorkingDirHostPathNormalization() {
+        val rootfsDir = tempFolder.newFolder("mock_rootfs_dir")
+        val rootHome = File(rootfsDir, "root")
+        rootHome.mkdirs()
+
+        // 1. Host path should be stripped to guest path
+        val hostWorkingDir = File(rootfsDir, "root").absolutePath
+        val normalized1 = ProotLauncher.resolveGuestWorkingDir(rootfsDir, hostWorkingDir)
+        assertEquals("Host filesystem path must be normalized to guest path", "/root", normalized1)
+
+        // 2. Relative or clean guest path preserved
+        val normalized2 = ProotLauncher.resolveGuestWorkingDir(rootfsDir, "/root")
+        assertEquals("Guest path /root must be preserved", "/root", normalized2)
+
+        // 3. Auto-creation of standard guest directories
+        val nonExistentRoot = File(tempFolder.newFolder("clean_rootfs"), "root")
+        val cleanRootfs = nonExistentRoot.parentFile!!
+        assertFalse(nonExistentRoot.exists())
+        val normalized3 = ProotLauncher.resolveGuestWorkingDir(cleanRootfs, "/root")
+        assertEquals("/root", normalized3)
+        assertTrue("/root must be automatically created in rootfs", File(cleanRootfs, "root").exists())
+
+        // 4. Fallback to / if non-standard path is unavailable
+        val normalized4 = ProotLauncher.resolveGuestWorkingDir(rootfsDir, "/non_existent_custom_dir")
+        assertEquals("Unavailable custom directory must fall back to /", "/", normalized4)
+    }
+
+    @Test
+    fun testProblemBBashExecveAndCompanionLoaderResolution() {
+        val mockNativeLibDir = tempFolder.newFolder("carrier_lib_dir")
+        val carrierProot = File(mockNativeLibDir, "libproot.so")
+        val carrierLoader = File(mockNativeLibDir, "libproot_loader.so")
+        assetProot.copyTo(carrierProot, overwrite = true)
+        assetLoader.copyTo(carrierLoader, overwrite = true)
+
+        val rootfsDir = tempFolder.newFolder("bash_chain_rootfs")
+
+        val prootConfig = ProotSessionConfig(
+            rootfsDir = rootfsDir,
+            prootExecutable = carrierProot,
+            loaderExecutable = null, // Verify automatic carrierLoader resolution
+            workingDir = "/root"
+        )
+
+        // Loader resolution must find adjacent libproot_loader.so
+        val resolvedLoader = ProotLauncher.resolveLoaderFile(prootConfig)
+        assertNotNull("Companion loader must be resolved", resolvedLoader)
+        assertEquals("Companion loader must match libproot_loader.so", carrierLoader.absolutePath, resolvedLoader?.absolutePath)
+
+        // Environment must strictly remove LD_PRELOAD and LD_LIBRARY_PATH
+        val env = ProotLauncher.buildProotEnvironment(
+            prootConfig.copy(customEnv = mapOf(
+                "LD_PRELOAD" to "/bad/android/lib.so",
+                "LD_LIBRARY_PATH" to "/bad/android/lib",
+                "CUSTOM_TEST" to "PASSED"
+            ))
+        )
+        assertFalse("Environment must not contain leaked LD_PRELOAD", env.containsKey("LD_PRELOAD"))
+        assertFalse("Environment must not contain leaked LD_LIBRARY_PATH", env.containsKey("LD_LIBRARY_PATH"))
+        assertEquals("PASSED", env["CUSTOM_TEST"])
+        assertEquals(carrierLoader.absolutePath, env["PROOT_LOADER"])
+    }
+
+    @Test
+    fun testProblemCHostTmpDirDedicatedAndConcurrentSessionIsolation() {
+        val linuxBase = tempFolder.newFolder("linux_base")
+        val rootfs = File(linuxBase, "rootfs").apply { mkdirs() }
+        val guestTmp = File(rootfs, "tmp").apply { mkdirs() }
+        val hostTmp = File(linuxBase, "tmp").apply { mkdirs() }
+
+        val configSession1 = ProotSessionConfig(
+            rootfsDir = rootfs,
+            prootExecutable = assetProot,
+            tmpDir = File(hostTmp, "session_1").apply { mkdirs() }
+        )
+        val configSession2 = ProotSessionConfig(
+            rootfsDir = rootfs,
+            prootExecutable = assetProot,
+            tmpDir = File(hostTmp, "session_2").apply { mkdirs() }
+        )
+
+        val resolvedTmp1 = ProotLauncher.resolveHostTmpDir(configSession1)
+        val resolvedTmp2 = ProotLauncher.resolveHostTmpDir(configSession2)
+
+        assertTrue(resolvedTmp1.exists() && resolvedTmp1.canWrite())
+        assertTrue(resolvedTmp2.exists() && resolvedTmp2.canWrite())
+        assertNotEquals("Concurrent sessions must have separate host temporary directories", resolvedTmp1.absolutePath, resolvedTmp2.absolutePath)
+
+        // Separate host PRoot temporary storage from guest /tmp
+        assertFalse("Host PRoot temporary storage must not be inside guest /tmp", resolvedTmp1.absolutePath.startsWith(guestTmp.absolutePath))
+        assertFalse("Host PRoot temporary storage must not be inside guest /tmp", resolvedTmp2.absolutePath.startsWith(guestTmp.absolutePath))
+
+        // Create file in session 1; simulate session 2 cleanup does not delete session 1
+        val session1File = File(resolvedTmp1, "proot-123-socket")
+        session1File.writeText("active_session_data")
+
+        resolvedTmp2.deleteRecursively()
+        assertTrue("Session 1 temporary files must remain alive during other session operations", session1File.exists())
+    }
 }

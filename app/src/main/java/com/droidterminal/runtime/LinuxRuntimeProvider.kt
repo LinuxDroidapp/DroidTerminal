@@ -58,6 +58,10 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
 
     override fun getHomeDirectory(): File = File(getRootfsDirectory(), "root")
 
+    fun getGuestWorkingDirectory(): String = "/root"
+
+    fun getTmpDirectory(): File = tmpDir
+
     override fun getEnvironment(): Map<String, String> {
         val env = mutableMapOf(
             "TERM" to "xterm-256color",
@@ -71,7 +75,14 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
             "LC_ALL" to "C.UTF-8",
             "DEBIAN_FRONTEND" to "noninteractive"
         )
-        if (loaderFile.exists()) {
+        val loader = try {
+            RuntimeAssetsManager(context, linuxDir).resolveLoader()
+        } catch (_: Throwable) {
+            null
+        }
+        if (loader != null && loader.exists()) {
+            env["PROOT_LOADER"] = loader.absolutePath
+        } else if (loaderFile.exists()) {
             env["PROOT_LOADER"] = loaderFile.absolutePath
         }
         if (tmpDir.exists()) {
@@ -81,11 +92,16 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
     }
 
     override fun getBindMounts(): List<Pair<String, String>> {
-        val rootfs = getRootfsDirectory()
-        val tmpHost = File(rootfs, "tmp")
-        if (!tmpHost.exists()) tmpHost.mkdirs()
+        val shmBacking = File(linuxDir, "shm")
+        if (!shmBacking.exists()) shmBacking.mkdirs()
+        try {
+            shmBacking.setReadable(true, false)
+            shmBacking.setWritable(true, false)
+            shmBacking.setExecutable(true, false)
+            android.system.Os.chmod(shmBacking.absolutePath, 1007) // 1777 octal
+        } catch (_: Throwable) {}
         return listOf(
-            tmpHost.absolutePath to "/dev/shm"
+            shmBacking.canonicalFile.absolutePath to "/dev/shm"
         )
     }
 
@@ -93,7 +109,55 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
         return try {
             val rootfs = getRootfsDirectory()
 
-            // 1. Setup /etc/resolv.conf for Google and Cloudflare DNS
+            // 1. Prepare host temporary directory (isolated from guest /tmp)
+            if (!tmpDir.exists()) tmpDir.mkdirs()
+            try {
+                tmpDir.setReadable(true, false)
+                tmpDir.setWritable(true, false)
+                tmpDir.setExecutable(true, false)
+                android.system.Os.chmod(tmpDir.absolutePath, 509) // 0777 octal
+            } catch (_: Throwable) {}
+
+            // 2. Ensure /root exists inside rootfs with proper permissions
+            val rootDir = File(rootfs, "root")
+            if (!rootDir.exists()) rootDir.mkdirs()
+            try {
+                rootDir.setReadable(true, false)
+                rootDir.setWritable(true, false)
+                rootDir.setExecutable(true, false)
+                android.system.Os.chmod(rootDir.absolutePath, 448) // 0700 octal
+            } catch (_: Throwable) {}
+
+            // 3. Ensure guest /tmp has sticky bit 1777
+            val guestTmp = File(rootfs, "tmp")
+            if (!guestTmp.exists()) guestTmp.mkdirs()
+            try {
+                guestTmp.setReadable(true, false)
+                guestTmp.setWritable(true, false)
+                guestTmp.setExecutable(true, false)
+                android.system.Os.chmod(guestTmp.absolutePath, 1007) // 1777 octal
+            } catch (_: Throwable) {}
+
+            // 4. Ensure bash and dynamic linkers have executable permissions
+            listOf(
+                File(rootfs, "usr/bin/bash"),
+                File(rootfs, "bin/bash"),
+                File(rootfs, "usr/bin/sh"),
+                File(rootfs, "bin/sh"),
+                File(rootfs, "usr/bin/true"),
+                File(rootfs, "bin/true"),
+                File(rootfs, "lib/ld-linux-aarch64.so.1"),
+                File(rootfs, "usr/lib/ld-linux-aarch64.so.1"),
+                File(rootfs, "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1")
+            ).forEach { f ->
+                if (f.exists()) {
+                    f.setReadable(true, false)
+                    f.setExecutable(true, false)
+                    try { android.system.Os.chmod(f.absolutePath, 493) } catch (_: Throwable) {}
+                }
+            }
+
+            // 5. Setup /etc/resolv.conf for Google and Cloudflare DNS
             val etcDir = File(rootfs, "etc")
             if (!etcDir.exists()) etcDir.mkdirs()
             val resolv = File(etcDir, "resolv.conf")
@@ -101,13 +165,13 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
                 resolv.writeText("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
             }
 
-            // 2. Setup /etc/hosts
+            // 6. Setup /etc/hosts
             val hosts = File(etcDir, "hosts")
             if (!hosts.exists() || hosts.length() == 0L) {
                 hosts.writeText("127.0.0.1 localhost ubuntu\n::1 localhost ip6-localhost ip6-loopback\n")
             }
 
-            // 3. Fix APT sandbox drop permissions (_apt error under PRoot)
+            // 7. Fix APT sandbox drop permissions (_apt error under PRoot)
             val aptConfDir = File(etcDir, "apt/apt.conf.d")
             if (!aptConfDir.exists()) aptConfDir.mkdirs()
             val aptSandbox = File(aptConfDir, "01sandbox")
@@ -115,13 +179,14 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
                 aptSandbox.writeText("APT::Sandbox::User \"root\";\n")
             }
 
-            // 4. Fix policy-rc.d to prevent systemd service starts during apt install
+            // 8. Fix policy-rc.d to prevent systemd service starts during apt install
             val sbinDir = File(rootfs, "usr/sbin")
             if (!sbinDir.exists()) sbinDir.mkdirs()
             val policyRc = File(sbinDir, "policy-rc.d")
             if (!policyRc.exists()) {
                 policyRc.writeText("#!/bin/sh\nexit 101\n")
                 policyRc.setExecutable(true, false)
+                try { android.system.Os.chmod(policyRc.absolutePath, 493) } catch (_: Throwable) {}
             }
 
             RuntimeResult.Success
@@ -151,11 +216,13 @@ class LinuxDroidRuntimeProvider(
 
     override fun getHomeDirectory(): File = externalHomeDir
 
+    fun getGuestWorkingDirectory(): String = "/root"
+
     override fun getEnvironment(): Map<String, String> {
         val defaultEnv = mutableMapOf(
             "TERM" to "xterm-256color",
             "COLORTERM" to "truecolor",
-            "HOME" to externalHomeDir.absolutePath,
+            "HOME" to "/root",
             "USER" to "root",
             "SHELL" to "/bin/bash",
             "PATH" to "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

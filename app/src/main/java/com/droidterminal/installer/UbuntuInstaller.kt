@@ -671,10 +671,12 @@ class UbuntuInstaller(
         val pb = ProcessBuilder(prootBin.absolutePath, "--version")
         pb.redirectErrorStream(true)
         val env = pb.environment()
+        env.remove("LD_PRELOAD")
+        env.remove("LD_LIBRARY_PATH")
         if (tmpDir.exists()) {
             env["PROOT_TMP_DIR"] = tmpDir.canonicalPath
         }
-        val loader = activeLoaderFile ?: if (loaderFile.exists()) loaderFile else null
+        val loader = activeLoaderFile ?: resolveCarrierLoader() ?: if (loaderFile.exists()) loaderFile else null
         if (loader?.exists() == true) {
             env["PROOT_LOADER"] = loader.canonicalPath
         }
@@ -775,8 +777,24 @@ class UbuntuInstaller(
         policyRc.writeText("#!/bin/sh\nexit 101\n")
         setExecutablePermissions(policyRc)
 
+        // Problem A: Ensure standard rootfs directories exist with valid permissions and ownership
+        val standardDirs = listOf(
+            "root", "home", "tmp", "dev", "dev/pts", "dev/shm",
+            "proc", "sys", "etc", "run", "var", "var/tmp",
+            "usr", "usr/bin", "usr/sbin", "usr/lib"
+        )
+        standardDirs.forEach { dirName ->
+            val d = File(rootfsDir, dirName)
+            if (!d.exists()) d.mkdirs()
+        }
+
         val rootHome = File(rootfsDir, "root")
         if (!rootHome.exists()) rootHome.mkdirs()
+        rootHome.setReadable(true, false)
+        rootHome.setWritable(true, false)
+        rootHome.setExecutable(true, false)
+        try { android.system.Os.chmod(rootHome.absolutePath, 448) } catch (_: Throwable) {} // 0700 octal
+
         val bashrc = File(rootHome, ".bashrc")
         if (!bashrc.exists()) {
             bashrc.writeText(
@@ -789,33 +807,67 @@ class UbuntuInstaller(
                 alias ls='ls --color=auto'
                 alias ll='ls -la'
                 alias grep='grep --color=auto'
-                """.trimIndent()
+                """.trimIndent() + "\n"
             )
         }
 
-        // Ensure required mount targets exist
-        listOf("dev", "proc", "sys", "tmp", "dev/shm", "dev/pts").forEach {
-            val d = File(rootfsDir, it)
-            if (!d.exists()) d.mkdirs()
-        }
-
-        // Ensure guest /tmp and /dev/shm have 1777 permissions
+        // Ensure guest /tmp, /var/tmp and /dev/shm have 1777 sticky bit permissions
         setStickyPermissions(File(rootfsDir, "tmp"))
+        setStickyPermissions(File(rootfsDir, "var/tmp"))
         setStickyPermissions(File(rootfsDir, "dev/shm"))
 
-        // Ensure guest dynamic linkers and shell executables have 0755
-        listOf("usr/bin/bash", "bin/bash", "usr/bin/sh", "bin/sh").forEach {
-            val f = File(rootfsDir, it)
-            if (f.exists()) setExecutablePermissions(f)
+        // Problem B: Verify and repair UsrMerge symlinks (bin -> usr/bin, sbin -> usr/sbin, lib -> usr/lib, lib64 -> usr/lib64)
+        val symlinkPairs = listOf(
+            "bin" to "usr/bin",
+            "sbin" to "usr/sbin",
+            "lib" to "usr/lib",
+            "lib64" to "usr/lib64"
+        )
+        symlinkPairs.forEach { (linkName, targetRel) ->
+            val linkFile = File(rootfsDir, linkName)
+            val targetFile = File(rootfsDir, targetRel)
+            if (!linkFile.exists()) {
+                if (targetFile.exists()) {
+                    try {
+                        android.system.Os.symlink(targetRel, linkFile.absolutePath)
+                    } catch (_: Throwable) {}
+                }
+            }
         }
 
-        listOf(
+        // Problem B: Ensure dynamic linkers exist and have 0755 permissions
+        val dynamicLinkerPaths = listOf(
             "lib/ld-linux-aarch64.so.1",
             "usr/lib/ld-linux-aarch64.so.1",
             "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
-        ).forEach {
-            val linker = File(rootfsDir, it)
-            if (linker.exists()) setExecutablePermissions(linker)
+        )
+        var primaryLinker: File? = null
+        dynamicLinkerPaths.forEach { relPath ->
+            val linker = File(rootfsDir, relPath)
+            if (linker.exists()) {
+                setExecutablePermissions(linker)
+                if (primaryLinker == null) primaryLinker = linker
+            }
+        }
+
+        // If /lib/ld-linux-aarch64.so.1 is missing but found in usr/lib, symlink it to prevent execve failure
+        val libLd = File(rootfsDir, "lib/ld-linux-aarch64.so.1")
+        if (!libLd.exists() && primaryLinker != null) {
+            try {
+                libLd.parentFile?.mkdirs()
+                android.system.Os.symlink(primaryLinker!!.absolutePath, libLd.absolutePath)
+                setExecutablePermissions(libLd)
+            } catch (_: Throwable) {}
+        }
+
+        // Problem B: Ensure guest shell executables have 0755
+        listOf(
+            "usr/bin/bash", "bin/bash",
+            "usr/bin/sh", "bin/sh",
+            "usr/bin/true", "bin/true"
+        ).forEach { relPath ->
+            val f = File(rootfsDir, relPath)
+            if (f.exists()) setExecutablePermissions(f)
         }
     }
 
@@ -894,12 +946,19 @@ class UbuntuInstaller(
 
     /**
      * Stage B: Rootfs Structure Verification.
-     * Verifies bash exists, dynamic linker interpreter exists, and guest /tmp has 1777 permissions.
+     * Verifies bash exists, dynamic linker interpreter exists, /root exists, and guest /tmp has 1777 permissions.
      */
     fun verifyStageBRootfsStructure(): Boolean {
         if (!rootfsDir.exists() || !rootfsDir.isDirectory) {
             throw IllegalStateException("Stage B Failed: Rootfs directory missing: ${rootfsDir.absolutePath}")
         }
+
+        // Problem A: Verify /root directory exists inside rootfs
+        val rootDir = File(rootfsDir, "root")
+        if (!rootDir.exists()) {
+            rootDir.mkdirs()
+        }
+        setExecutablePermissions(rootDir)
 
         val bashFile = File(rootfsDir, "bin/bash")
         val usrBashFile = File(rootfsDir, "usr/bin/bash")
@@ -908,6 +967,27 @@ class UbuntuInstaller(
         }
         val targetBash = if (usrBashFile.exists()) usrBashFile else bashFile
         setExecutablePermissions(targetBash)
+
+        // Problem B: Inspect Bash's ELF architecture and program interpreter
+        val elfResult = ElfValidator.validateArm64Elf(targetBash)
+        if (elfResult.isValid && elfResult.interpreter != null) {
+            val interpFile = File(rootfsDir, elfResult.interpreter.removePrefix("/"))
+            if (!interpFile.exists()) {
+                val altInterp = listOf(
+                    File(rootfsDir, "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"),
+                    File(rootfsDir, "usr/lib/ld-linux-aarch64.so.1")
+                ).firstOrNull { it.exists() }
+                if (altInterp != null) {
+                    try {
+                        interpFile.parentFile?.mkdirs()
+                        android.system.Os.symlink(altInterp.absolutePath, interpFile.absolutePath)
+                    } catch (_: Throwable) {}
+                }
+            }
+            if (interpFile.exists()) {
+                setExecutablePermissions(interpFile)
+            }
+        }
 
         val dynamicLinkers = listOf(
             File(rootfsDir, "lib/ld-linux-aarch64.so.1"),
@@ -941,22 +1021,62 @@ class UbuntuInstaller(
 
     /**
      * Stage D: Shell Execution Verification.
+     * Problem B Staged Tests:
+     * 1. Execute "/bin/true"
+     * 2. Execute "/usr/bin/bash -c 'echo DROIDTERMINAL_BASH_OK'"
      */
     fun verifyStageDShellExecution(): Boolean {
         val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
         val loader = activeLoaderFile ?: assetsManager.resolveLoader()
-        val prootConfig = ProotSessionConfig(
+
+        // Staged Test 1: Execute "/bin/true"
+        val trueCandidates = listOf(
+            File(rootfsDir, "bin/true"),
+            File(rootfsDir, "usr/bin/true")
+        )
+        val trueFile = trueCandidates.firstOrNull { it.exists() }
+        if (trueFile != null) {
+            setExecutablePermissions(trueFile)
+            val trueGuestPath = if (trueFile.absolutePath.startsWith(File(rootfsDir, "usr").absolutePath)) "/usr/bin/true" else "/bin/true"
+            val trueConfig = ProotSessionConfig(
+                rootfsDir = rootfsDir,
+                prootExecutable = proot,
+                loaderExecutable = loader,
+                tmpDir = tmpDir,
+                workingDir = "/root",
+                executable = trueGuestPath,
+                args = emptyList()
+            )
+            val (trueExit, trueOutput) = ProotLauncher.executeHeadless(trueConfig)
+            if (trueExit != 0) {
+                throw IllegalStateException("Stage D Failed: /bin/true execution failed (exit code $trueExit, output: $trueOutput)")
+            }
+        }
+
+        // Staged Test 2: Execute "/usr/bin/bash -c 'echo DROIDTERMINAL_BASH_OK'"
+        val bashCandidate = listOf(
+            File(rootfsDir, "usr/bin/bash"),
+            File(rootfsDir, "bin/bash")
+        ).firstOrNull { it.exists() }
+        val bashGuestPath = if (bashCandidate?.exists() == true &&
+            bashCandidate.absolutePath.startsWith(File(rootfsDir, "usr").absolutePath)) {
+            "/usr/bin/bash"
+        } else {
+            "/bin/bash"
+        }
+
+        val bashConfig = ProotSessionConfig(
             rootfsDir = rootfsDir,
             prootExecutable = proot,
             loaderExecutable = loader,
             tmpDir = tmpDir,
             workingDir = "/root",
-            executable = "/bin/bash",
-            args = listOf("-c", "echo DROIDTERMINAL_PROOT_OK")
+            executable = bashGuestPath,
+            args = listOf("-c", "echo DROIDTERMINAL_BASH_OK")
         )
 
-        val (exitCode, output) = ProotLauncher.executeHeadless(prootConfig)
-        if (exitCode != 0 || !output.contains("DROIDTERMINAL_PROOT_OK")) {
+        val (exitCode, output) = ProotLauncher.executeHeadless(bashConfig)
+        if (exitCode != 0 || !output.contains("DROIDTERMINAL_BASH_OK")) {
             throw IllegalStateException("Stage D Failed: Linux verification failed (exit code $exitCode, output: $output)")
         }
         return true

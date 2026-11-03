@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <signal.h>
+#include <sys/stat.h>
 
 namespace droidterm {
 
@@ -78,49 +79,80 @@ int spawnPtyProcess(const SessionConfig& config, std::shared_ptr<TerminalSession
         signal(SIGTTOU, SIG_DFL);
         signal(SIGCHLD, SIG_DFL);
 
+        // Problem B: Strictly purge Android host library leakage
+        unsetenv("LD_PRELOAD");
+        unsetenv("LD_LIBRARY_PATH");
+
         setenv("TERM", "xterm-256color", 1);
         setenv("COLORTERM", "truecolor", 1);
         setenv("LANG", "en_US.UTF-8", 1);
         setenv("LC_ALL", "en_US.UTF-8", 1);
 
         for (const auto& envPair : config.envVars) {
-            setenv(envPair.first.c_str(), envPair.second.c_str(), 1);
+            if (envPair.first != "LD_PRELOAD" && envPair.first != "LD_LIBRARY_PATH") {
+                setenv(envPair.first.c_str(), envPair.second.c_str(), 1);
+            }
         }
 
         std::vector<std::string> argStrings;
         if (config.isProot && !config.prootBinPath.empty() && !config.rootfsPath.empty()) {
-            // Auto-detect and configure PROOT_LOADER if not explicitly provided
+            // Problem B: Auto-detect and configure PROOT_LOADER if not explicitly provided
+            // Resolves carrier libproot_loader.so first (SELinux apk_data_file execution compliant)
+            if (getenv("PROOT_LOADER") == nullptr) {
+                char resolvedReal[PATH_MAX];
+                if (realpath(config.prootBinPath.c_str(), resolvedReal) != nullptr) {
+                    std::string realBin = resolvedReal;
+                    size_t rSlash = realBin.find_last_of('/');
+                    if (rSlash != std::string::npos) {
+                        std::string carrierDir = realBin.substr(0, rSlash);
+                        std::string carrierLoader = carrierDir + "/libproot_loader.so";
+                        if (access(carrierLoader.c_str(), R_OK) == 0) {
+                            setenv("PROOT_LOADER", carrierLoader.c_str(), 1);
+                        }
+                    }
+                }
+            }
+
             if (getenv("PROOT_LOADER") == nullptr) {
                 std::string prootDir;
                 size_t slashPos = config.prootBinPath.find_last_of('/');
                 if (slashPos != std::string::npos) {
                     prootDir = config.prootBinPath.substr(0, slashPos);
                 }
-                std::string loaderCandidate = prootDir + "/loader";
-                if (access(loaderCandidate.c_str(), X_OK) == 0) {
-                    setenv("PROOT_LOADER", loaderCandidate.c_str(), 1);
+                std::string soLoader = prootDir + "/libproot_loader.so";
+                if (access(soLoader.c_str(), R_OK) == 0) {
+                    setenv("PROOT_LOADER", soLoader.c_str(), 1);
                 } else {
-                    std::string soLoader = prootDir + "/libproot_loader.so";
-                    if (access(soLoader.c_str(), R_OK) == 0) {
-                        setenv("PROOT_LOADER", soLoader.c_str(), 1);
+                    std::string loaderCandidate = prootDir + "/loader";
+                    if (access(loaderCandidate.c_str(), X_OK) == 0) {
+                        setenv("PROOT_LOADER", loaderCandidate.c_str(), 1);
                     }
                 }
             }
 
-            // Auto-configure PROOT_TMP_DIR if not explicitly provided
+            // Problem C: Dedicated host temporary directory configuration
             if (getenv("PROOT_TMP_DIR") == nullptr) {
-                std::string prootDir;
-                size_t slashPos = config.prootBinPath.find_last_of('/');
+                std::string rootfsParent;
+                size_t slashPos = config.rootfsPath.find_last_of('/');
                 if (slashPos != std::string::npos) {
-                    prootDir = config.prootBinPath.substr(0, slashPos);
-                    std::string tmpCandidate = prootDir + "/../tmp";
+                    rootfsParent = config.rootfsPath.substr(0, slashPos);
+                    std::string tmpCandidate = rootfsParent + "/tmp";
+                    mkdir(tmpCandidate.c_str(), 0777);
+                    chmod(tmpCandidate.c_str(), 0777);
                     if (access(tmpCandidate.c_str(), W_OK) == 0) {
                         setenv("PROOT_TMP_DIR", tmpCandidate.c_str(), 1);
                     }
                 }
+            } else {
+                const char* curTmp = getenv("PROOT_TMP_DIR");
+                if (curTmp != nullptr) {
+                    mkdir(curTmp, 0777);
+                    chmod(curTmp, 0777);
+                }
             }
 
             argStrings.push_back(config.prootBinPath);
+            argStrings.push_back("--kill-on-exit");
             argStrings.push_back("--link2symlink");
             argStrings.push_back("-0");
             argStrings.push_back("-r");
@@ -142,13 +174,24 @@ int spawnPtyProcess(const SessionConfig& config, std::shared_ptr<TerminalSession
                 }
             }
 
-            if (!config.workingDir.empty()) {
-                argStrings.push_back("-w");
-                argStrings.push_back(config.workingDir);
-            } else {
-                argStrings.push_back("-w");
-                argStrings.push_back("/root");
+            // Problem A: Guest working directory normalization (never pass host path)
+            std::string guestWd = config.workingDir.empty() ? "/root" : config.workingDir;
+            if (!config.rootfsPath.empty() && guestWd.rfind(config.rootfsPath, 0) == 0) {
+                guestWd = guestWd.substr(config.rootfsPath.length());
             }
+            if (guestWd.empty() || guestWd[0] != '/') {
+                guestWd = "/" + guestWd;
+            }
+            std::string fullWd = config.rootfsPath + guestWd;
+            if (access(fullWd.c_str(), F_OK) != 0) {
+                if (guestWd == "/root" || guestWd == "/tmp" || guestWd == "/home") {
+                    mkdir(fullWd.c_str(), 0755);
+                } else {
+                    guestWd = "/";
+                }
+            }
+            argStrings.push_back("-w");
+            argStrings.push_back(guestWd);
 
             std::string shellExe = config.executable.empty() ? "/bin/bash" : config.executable;
             argStrings.push_back(shellExe);
@@ -183,7 +226,7 @@ int spawnPtyProcess(const SessionConfig& config, std::shared_ptr<TerminalSession
         LOGI("Child executing: %s", cArgs[0]);
         execvp(cArgs[0], cArgs.data());
 
-        LOGE("execvp failed for %s: %s", cArgs[0], strerror(errno));
+        LOGE("execvp failed for %s: errno=%d (%s)", cArgs[0], errno, strerror(errno));
         _exit(127);
     }
 

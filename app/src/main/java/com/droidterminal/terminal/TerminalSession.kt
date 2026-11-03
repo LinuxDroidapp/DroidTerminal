@@ -6,7 +6,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.droidterminal.runtime.LinuxRuntimeProvider
 import com.droidterminal.runtime.NativePtyBridge
+import com.droidterminal.runtime.StandaloneRuntimeProvider
 import kotlinx.coroutines.*
+import java.io.File
 import java.util.UUID
 
 data class TerminalSearchMatch(
@@ -67,6 +69,7 @@ class TerminalSession(
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var readJob: Job? = null
+    private var sessionTmpDir: File? = null
 
     val parser = TerminalParser(
         buffer = buffer,
@@ -84,10 +87,37 @@ class TerminalSession(
         scope.launch {
             runtimeProvider.prepareSession()
 
+            // Dedicated, collision-free host temporary directory for this session
+            val hostTmpBase = (runtimeProvider as? StandaloneRuntimeProvider)?.getTmpDirectory()
+                ?: File(runtimeProvider.getRootfsDirectory().parentFile ?: runtimeProvider.getRootfsDirectory(), "tmp")
+            val hostTmp = File(hostTmpBase, "session_$id").apply {
+                if (!exists()) mkdirs()
+                setReadable(true, false)
+                setWritable(true, false)
+                setExecutable(true, false)
+                try {
+                    android.system.Os.chmod(absolutePath, 509) // 0777 octal
+                } catch (_: Throwable) {}
+            }
+            sessionTmpDir = hostTmp
+
+            val loaderExecutable = (runtimeProvider as? StandaloneRuntimeProvider)?.let {
+                try {
+                    com.droidterminal.runtime.RuntimeAssetsManager(null, it.linuxDir).resolveLoader()
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+
+            // Problem A: Guest working directory must always be a guest path, never a host path
+            val guestWorkingDir = (runtimeProvider as? StandaloneRuntimeProvider)?.getGuestWorkingDirectory() ?: "/root"
+
             val prootConfig = com.droidterminal.runtime.ProotSessionConfig(
                 rootfsDir = runtimeProvider.getRootfsDirectory(),
                 prootExecutable = runtimeProvider.getProotExecutable(),
-                workingDir = runtimeProvider.getHomeDirectory().absolutePath,
+                loaderExecutable = loaderExecutable,
+                tmpDir = hostTmp,
+                workingDir = guestWorkingDir,
                 executable = "/bin/bash",
                 args = listOf("-l"),
                 customEnv = runtimeProvider.getEnvironment(),
@@ -252,6 +282,14 @@ class TerminalSession(
         if (nativeSessionId >= 0) {
             NativePtyBridge.nativeCloseSession(nativeSessionId)
             nativeSessionId = -1
+        }
+        // Safely delete session-specific host temporary files only after PRoot process exits
+        sessionTmpDir?.let { dir ->
+            try {
+                if (dir.exists()) {
+                    dir.deleteRecursively()
+                }
+            } catch (_: Throwable) {}
         }
     }
 }
