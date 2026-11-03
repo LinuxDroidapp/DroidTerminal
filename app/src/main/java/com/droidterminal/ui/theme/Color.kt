@@ -20,6 +20,7 @@ val TerminalBackground = Color(0xFF12141A)   // Inner viewport background
 val AccentCyan = Color(0xFF38BDF8)          // Neon Cyan cursor & active modifier
 val AccentGreen = Color(0xFF4ADE80)         // Prompt green & success
 val AccentOrange = Color(0xFFFB923C)        // Warning / split indicator
+val ErrorRed = Color(0xFFEF4444)            // Error / failure alert
 
 // macOS Window Traffic Lights
 val MacTrafficClose = Color(0xFFFF5F57)     // Close (Red)

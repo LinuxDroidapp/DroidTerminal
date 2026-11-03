@@ -105,8 +105,11 @@ DroidTerminal/
 │       ├── test_pty_engine.cpp            # C++ PTY test suite (100% PASS)
 │       └── test_parser.py                 # VT parser test suite (100% PASS)
 ├── docs/
-│   ├── ARCHITECTURE.md                    # Deep systems architecture
-│   └── LINUXDROID_INTEGRATION.md          # LinuxDroid embedding guide
+│   ├── ARCHITECTURE.md                    # Deep systems architecture (or architecture.md)
+│   ├── LINUXDROID_INTEGRATION.md          # LinuxDroid embedding guide (or integration.md)
+│   ├── installation.md                    # First-launch Ubuntu setup, PRoot, & recovery
+│   ├── build.md                           # Build guide for Android Studio & Termux ARM64
+│   └── testing.md                         # Verification and test suites documentation
 ├── .github/workflows/
 │   └── ci.yml                             # Automated GitHub Actions CI
 ├── build.gradle.kts
@@ -116,26 +119,24 @@ DroidTerminal/
 
 ---
 
-## 🛠️ Build Instructions
+## 🛠️ Build & Documentation
 
-### Prerequisites
-* Android Studio (Ladybug or newer)
-* JDK 17
-* Android SDK Platform 34
-* Android NDK (r25c / `25.2.9519653` or newer)
-* CMake 3.22.1+
+Detailed guides are available in the `docs/` folder:
+* 📘 [Architecture Guide](docs/architecture.md): POSIX PTY engine, VT100 parser, Compose canvas renderer, and supervisor.
+* 🚀 [Installation Guide](docs/installation.md): First-launch Ubuntu 26.04 ARM64 installation, PRoot preparation, and rootless compatibility.
+* 📦 [LinuxDroid Integration Guide](docs/integration.md): Zero-duplication embedding with LinuxDroid's PRoot runtime.
+* 🔨 [Build Guide](docs/build.md): Building with Gradle 9.7.1, AGP 9.3.2, NDK r29 on Android Studio and native Termux ARM64.
+* 🧪 [Testing Guide](docs/testing.md): Native C++ unit tests, keyboard state machine, and parser verification.
 
 ### Building via Command Line
 ```bash
-# Clone the repository
-git clone https://github.com/LinuxDroidapp/DroidTerminal.git
-cd DroidTerminal
-
-# Build debug APK
+# Debug APK:
 ./gradlew assembleDebug
+# Generated at: app/build/outputs/apk/debug/app-debug.apk
 
-# Output APK location:
-# app/build/outputs/apk/debug/app-debug.apk
+# Release APK:
+./gradlew assembleRelease
+# Generated at: app/build/outputs/apk/release/app-release-unsigned.apk
 ```
 
 ---

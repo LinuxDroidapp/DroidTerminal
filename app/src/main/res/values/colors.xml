@@ -1,4 +1,5 @@
 <resources>
     <color name="neo_bg">#171A22</color>
     <color name="neo_surface">#202531</color>
+    <color name="ic_launcher_background">#0B0F19</color>
 </resources>

@@ -89,6 +89,37 @@ int spawnPtyProcess(const SessionConfig& config, std::shared_ptr<TerminalSession
 
         std::vector<std::string> argStrings;
         if (config.isProot && !config.prootBinPath.empty() && !config.rootfsPath.empty()) {
+            // Auto-detect and configure PROOT_LOADER if not explicitly provided
+            if (getenv("PROOT_LOADER") == nullptr) {
+                std::string prootDir;
+                size_t slashPos = config.prootBinPath.find_last_of('/');
+                if (slashPos != std::string::npos) {
+                    prootDir = config.prootBinPath.substr(0, slashPos);
+                }
+                std::string loaderCandidate = prootDir + "/loader";
+                if (access(loaderCandidate.c_str(), X_OK) == 0) {
+                    setenv("PROOT_LOADER", loaderCandidate.c_str(), 1);
+                } else {
+                    std::string soLoader = prootDir + "/libproot_loader.so";
+                    if (access(soLoader.c_str(), R_OK) == 0) {
+                        setenv("PROOT_LOADER", soLoader.c_str(), 1);
+                    }
+                }
+            }
+
+            // Auto-configure PROOT_TMP_DIR if not explicitly provided
+            if (getenv("PROOT_TMP_DIR") == nullptr) {
+                std::string prootDir;
+                size_t slashPos = config.prootBinPath.find_last_of('/');
+                if (slashPos != std::string::npos) {
+                    prootDir = config.prootBinPath.substr(0, slashPos);
+                    std::string tmpCandidate = prootDir + "/../tmp";
+                    if (access(tmpCandidate.c_str(), W_OK) == 0) {
+                        setenv("PROOT_TMP_DIR", tmpCandidate.c_str(), 1);
+                    }
+                }
+            }
+
             argStrings.push_back(config.prootBinPath);
             argStrings.push_back("--link2symlink");
             argStrings.push_back("-0");

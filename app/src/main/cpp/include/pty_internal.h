@@ -17,14 +17,32 @@
 #include <unordered_map>
 #include <atomic>
 
+#include <cstdarg>
+#include <cstdio>
+
 #ifdef __ANDROID__
 #include <android/log.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+__attribute__((weak)) inline int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
+    (void)prio;
+    (void)tag;
+    va_list ap;
+    va_start(ap, fmt);
+    int res = vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+    return res;
+}
+#ifdef __cplusplus
+}
+#endif
 #define LOG_TAG "DroidTermNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #else
-#include <cstdio>
 #define LOGI(...) do { printf("[INFO] " __VA_ARGS__); printf("\n"); } while(0)
 #define LOGW(...) do { printf("[WARN] " __VA_ARGS__); printf("\n"); } while(0)
 #define LOGE(...) do { fprintf(stderr, "[ERROR] " __VA_ARGS__); fprintf(stderr, "\n"); } while(0)

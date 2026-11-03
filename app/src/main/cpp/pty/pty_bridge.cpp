@@ -1,5 +1,6 @@
 #include "pty_internal.h"
 #include <jni.h>
+#include <sys/stat.h>
 
 using namespace droidterm;
 
@@ -208,6 +209,18 @@ Java_com_droidterminal_runtime_NativePtyBridge_nativeGetSessionExitCode(
 
     checkProcessExit(session.get());
     return session->exitStatus.load();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_droidterminal_runtime_NativePtyBridge_nativeSetPermissions(
+        JNIEnv *env,
+        jobject thiz,
+        jstring pathStr,
+        jint mode) {
+    (void)thiz;
+    std::string path = jstringToString(env, pathStr);
+    if (path.empty()) return -1;
+    return chmod(path.c_str(), static_cast<mode_t>(mode));
 }
 
 } // extern "C"

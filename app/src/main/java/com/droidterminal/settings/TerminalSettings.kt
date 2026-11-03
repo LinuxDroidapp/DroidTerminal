@@ -9,6 +9,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -54,7 +56,9 @@ class TerminalSettingsManager(context: Context) {
 @Composable
 fun SettingsDialog(
     settings: TerminalSettingsManager,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onOpenDiagnostics: (() -> Unit)? = null,
+    onRepairLinux: (() -> Unit)? = null
 ) {
     var fontSize by remember { mutableFloatStateOf(settings.fontSizeSp) }
     var blinking by remember { mutableStateOf(settings.cursorBlinking) }
@@ -147,11 +151,38 @@ fun SettingsDialog(
 
                 HorizontalDivider(color = NeoBorder)
 
-                Text("Linux Runtime & Shell", color = AccentCyan, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text("Linux Runtime & Userspace", color = AccentCyan, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text("Environment: Genuine Ubuntu ARM64 via PRoot", color = TextSecondary, fontSize = 12.sp)
                 Text("Default Shell: /bin/bash (Login Shell)", color = TextSecondary, fontSize = 12.sp)
                 Text("TERM: xterm-256color", color = TextSecondary, fontSize = 12.sp)
                 Text("COLORTERM: truecolor", color = TextSecondary, fontSize = 12.sp)
-                Text("Scrollback Lines: 10,000", color = TextSecondary, fontSize = 12.sp)
+                Text("Scrollback History: 10,000 lines", color = TextSecondary, fontSize = 12.sp)
+
+                if (onOpenDiagnostics != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Button(
+                        onClick = onOpenDiagnostics,
+                        colors = ButtonDefaults.buttonColors(containerColor = NeoSurfaceRaised),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Info, contentDescription = null, tint = AccentCyan, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Open Runtime Diagnostics", color = TextPrimary, fontSize = 12.sp)
+                    }
+                }
+
+                if (onRepairLinux != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    OutlinedButton(
+                        onClick = onRepairLinux,
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = ErrorRed),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Reinstall / Repair Linux Environment", fontSize = 12.sp)
+                    }
+                }
             }
         }
     }

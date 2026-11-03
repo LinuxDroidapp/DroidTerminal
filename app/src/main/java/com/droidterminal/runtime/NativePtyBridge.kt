@@ -60,4 +60,14 @@ object NativePtyBridge {
     external fun nativeIsSessionAlive(sessionId: Int): Boolean
 
     external fun nativeGetSessionExitCode(sessionId: Int): Int
+
+    external fun nativeSetPermissions(path: String, mode: Int): Int
+
+    fun setFileMode(path: String, mode: Int): Boolean {
+        return try {
+            nativeSetPermissions(path, mode) == 0
+        } catch (e: Throwable) {
+            false
+        }
+    }
 }

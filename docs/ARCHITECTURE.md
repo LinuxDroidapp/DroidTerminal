@@ -89,3 +89,25 @@ The terminal parser implements a robust finite-state automaton:
 * **OSC (Operating System Command `\x1b]`)**:
   - Dynamic window title change (`OSC 0; <title> \x07`).
   - Hyperlinks (`OSC 8;; <url> \x07`).
+
+
+---
+
+## 5. Automatic First-Startup Ubuntu Installation & PRoot Initialization
+
+### 1. Automatic Execution Flow
+On very first application launch, DroidTerminal detects that the Linux environment is not yet installed and immediately presents the guided **Installation Screen** (`InstallationScreen.kt`), orchestrating a fully automated 12-stage setup:
+
+1. **System & Storage Verification**: Validates ARM64-v8a architecture and ensures $\ge 400\text{ MB}$ free internal storage.
+2. **Directory Creation**: Prepares private directory tree (`files/linux/rootfs`, `files/linux/bin`, `files/linux/tmp`, `files/linux/downloads`).
+3. **Official Ubuntu ARM64 Download**: Downloads official rootfs from `https://cdimage.ubuntu.com/ubuntu-base/releases/resolute/release/ubuntu-base-26.04.1-base-arm64.tar.gz` with HTTP Range resumption and live speed reporting.
+4. **Archive Integrity Verification**: Verifies SHA-256 hash (`5a1906794ced63a71a8119c3f211ef5f0bbe0a243001b4bbd41fdf80c5b219fd`).
+5. **Filesystem Extraction**: Extracts tarball into `files/linux/rootfs` using Android's native `toybox tar -xpf` preserving symlinks and permissions.
+6. **PRoot Runtime Deployment**: Extracts companion ARM64 `proot` and `loader` binaries from packaged assets to `files/linux/bin/` with `chmod 0755` executable permissions.
+7. **Filesystem Configuration**:
+   - `/etc/apt/apt.conf.d/01sandbox`: Configures `APT::Sandbox::User "root";` to allow `apt` package installations without unprivileged user switching errors under PRoot.
+   - `/usr/sbin/policy-rc.d`: Drops `exit 101` stub to prevent systemd service invocation errors.
+   - `/root/.bashrc`: Injects default color prompt and environment aliases.
+8. **DNS & Network Access**: Writes `/etc/resolv.conf` with Google (`8.8.8.8`) and Cloudflare (`1.1.1.1`) nameservers, plus `/etc/hosts`.
+9. **PRoot Initialization & Verification**: Headless validation run `proot -0 --link2symlink ... /bin/bash -c "echo LINUX_INIT_OK"`.
+10. **State Persistence**: Writes `.installed` completion marker and sets persistent preferences. Subsequent launches open the interactive terminal directly.

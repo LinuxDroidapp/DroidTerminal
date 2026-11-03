@@ -1,12 +1,13 @@
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
 
 android {
     namespace = "com.droidterminal"
-    compileSdk = 34
+    compileSdk = 36
+    buildToolsVersion = "36.0.0"
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "com.droidterminal"
@@ -17,11 +18,12 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
+            abiFilters += listOf("arm64-v8a")
         }
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++17 -Wall -Wextra"
+                arguments += listOf("-DANDROID_STL=c++_shared")
             }
         }
     }
@@ -43,17 +45,26 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
     buildFeatures {
         compose = true
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
+        }
+    }
+
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
         }
     }
 }

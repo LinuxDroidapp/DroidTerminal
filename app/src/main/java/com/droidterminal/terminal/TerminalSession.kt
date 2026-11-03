@@ -9,6 +9,39 @@ import com.droidterminal.runtime.NativePtyBridge
 import kotlinx.coroutines.*
 import java.util.UUID
 
+data class TerminalSearchMatch(
+    val lineIndex: Int,
+    val isScrollback: Boolean,
+    val colStart: Int,
+    val length: Int
+)
+
+class TerminalSearchState {
+    var query by mutableStateOf("")
+    var isSearchActive by mutableStateOf(false)
+    var currentMatchIndex by mutableIntStateOf(-1)
+    var matches by mutableStateOf<List<TerminalSearchMatch>>(emptyList())
+
+    fun clear() {
+        query = ""
+        isSearchActive = false
+        currentMatchIndex = -1
+        matches = emptyList()
+    }
+
+    fun nextMatch() {
+        if (matches.isNotEmpty()) {
+            currentMatchIndex = (currentMatchIndex + 1) % matches.size
+        }
+    }
+
+    fun prevMatch() {
+        if (matches.isNotEmpty()) {
+            currentMatchIndex = if (currentMatchIndex <= 0) matches.size - 1 else currentMatchIndex - 1
+        }
+    }
+}
+
 /**
  * Manages an independent live Linux terminal session, binding a native PTY master FD,
  * a VT parser, a TerminalBuffer, and asynchronous byte streaming.
@@ -23,6 +56,7 @@ class TerminalSession(
     var nativeSessionId: Int = -1
     val buffer = TerminalBuffer(cols, rows)
     val selection = TerminalSelection()
+    val searchState = TerminalSearchState()
 
     var isRunning by mutableStateOf(false)
     var isExited by mutableStateOf(false)
@@ -50,31 +84,19 @@ class TerminalSession(
         scope.launch {
             runtimeProvider.prepareSession()
 
-            val env = runtimeProvider.getEnvironment()
-            val envKeys = env.keys.toTypedArray()
-            val envVals = env.values.toTypedArray()
-
-            val binds = runtimeProvider.getBindMounts()
-            val bindSrcs = binds.map { it.first }.toTypedArray()
-            val bindTgts = binds.map { it.second }.toTypedArray()
-
-            val rootfs = runtimeProvider.getRootfsDirectory().absolutePath
-            val proot = runtimeProvider.getProotExecutable().absolutePath
-
-            nativeSessionId = NativePtyBridge.nativeCreateSession(
-                rootfsPath = rootfs,
-                prootBinPath = proot,
-                executable = "/bin/bash",
-                args = arrayOf("-l"),
+            val prootConfig = com.droidterminal.runtime.ProotSessionConfig(
+                rootfsDir = runtimeProvider.getRootfsDirectory(),
+                prootExecutable = runtimeProvider.getProotExecutable(),
                 workingDir = runtimeProvider.getHomeDirectory().absolutePath,
-                envKeys = envKeys,
-                envValues = envVals,
-                bindSources = bindSrcs,
-                bindTargets = bindTgts,
-                isProot = true,
+                executable = "/bin/bash",
+                args = listOf("-l"),
+                customEnv = runtimeProvider.getEnvironment(),
+                customBinds = runtimeProvider.getBindMounts(),
                 cols = cols,
                 rows = rows
             )
+
+            nativeSessionId = com.droidterminal.runtime.ProotLauncher.spawnInteractivePtySession(prootConfig)
 
             if (nativeSessionId < 0) {
                 // Standalone fallback: Try native /bin/sh if PRoot binary is not yet populated
@@ -164,6 +186,63 @@ class TerminalSession(
         if (nativeSessionId >= 0 && isRunning) {
             NativePtyBridge.nativeSendSignal(nativeSessionId, signal)
         }
+    }
+
+    fun performSearch(query: String) {
+        if (query.isBlank()) {
+            searchState.clear()
+            updateCounter++
+            return
+        }
+        searchState.query = query
+        searchState.isSearchActive = true
+        val found = mutableListOf<TerminalSearchMatch>()
+
+        synchronized(buffer) {
+            // 1. Search in scrollback buffer
+            val scrollbackSize = buffer.scrollback.size()
+            for (i in 0 until scrollbackSize) {
+                val line = buffer.scrollback.getLine(i) ?: continue
+                val sb = StringBuilder()
+                for (cell in line) {
+                    if (cell.codePoint != 0) {
+                        sb.append(Character.toChars(cell.codePoint))
+                    } else {
+                        sb.append(' ')
+                    }
+                }
+                val text = sb.toString()
+                var idx = text.indexOf(query, ignoreCase = true)
+                while (idx >= 0) {
+                    found.add(TerminalSearchMatch(lineIndex = i, isScrollback = true, colStart = idx, length = query.length))
+                    idx = text.indexOf(query, idx + 1, ignoreCase = true)
+                }
+            }
+
+            // 2. Search in active screen
+            val screen = buffer.activeScreen
+            for (r in 0 until rows) {
+                val sb = StringBuilder()
+                for (c in 0 until cols) {
+                    val cell = screen[r][c]
+                    if (cell.codePoint != 0) {
+                        sb.append(Character.toChars(cell.codePoint))
+                    } else {
+                        sb.append(' ')
+                    }
+                }
+                val text = sb.toString()
+                var idx = text.indexOf(query, ignoreCase = true)
+                while (idx >= 0) {
+                    found.add(TerminalSearchMatch(lineIndex = r, isScrollback = false, colStart = idx, length = query.length))
+                    idx = text.indexOf(query, idx + 1, ignoreCase = true)
+                }
+            }
+        }
+
+        searchState.matches = found
+        searchState.currentMatchIndex = if (found.isNotEmpty()) 0 else -1
+        updateCounter++
     }
 
     fun close() {

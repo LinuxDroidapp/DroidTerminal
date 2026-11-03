@@ -27,24 +27,35 @@ interface LinuxRuntimeProvider {
  */
 class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProvider {
 
-    override fun getRuntimeName(): String = "Standalone Ubuntu LTS"
+    val linuxDir: File = File(context.filesDir, "linux")
+    val rootfsDir: File = File(linuxDir, "rootfs")
+    val binDir: File = File(linuxDir, "bin")
+    val tmpDir: File = File(linuxDir, "tmp")
+    val prootFile: File = File(binDir, "proot")
+    val loaderFile: File = File(binDir, "loader")
+
+    override fun getRuntimeName(): String = "Ubuntu ARM64 (PRoot)"
 
     override fun getProotExecutable(): File {
-        val binDir = File(context.filesDir, "bin")
-        if (!binDir.exists()) binDir.mkdirs()
-        return File(binDir, "proot")
+        if (prootFile.exists()) return prootFile
+        val nativeLibProot = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
+        if (nativeLibProot.exists()) return nativeLibProot
+        val legacy = File(context.filesDir, "bin/proot")
+        if (legacy.exists()) return legacy
+        return prootFile
     }
 
     override fun getRootfsDirectory(): File {
-        val dir = File(context.filesDir, "rootfs")
-        if (!dir.exists()) dir.mkdirs()
-        return dir
+        if (rootfsDir.exists()) return rootfsDir
+        val legacy = File(context.filesDir, "rootfs")
+        if (legacy.exists()) return legacy
+        return rootfsDir
     }
 
     override fun getHomeDirectory(): File = File(getRootfsDirectory(), "root")
 
     override fun getEnvironment(): Map<String, String> {
-        return mapOf(
+        val env = mutableMapOf(
             "TERM" to "xterm-256color",
             "COLORTERM" to "truecolor",
             "HOME" to "/root",
@@ -56,13 +67,21 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
             "LC_ALL" to "C.UTF-8",
             "DEBIAN_FRONTEND" to "noninteractive"
         )
+        if (loaderFile.exists()) {
+            env["PROOT_LOADER"] = loaderFile.absolutePath
+        }
+        if (tmpDir.exists()) {
+            env["PROOT_TMP_DIR"] = tmpDir.absolutePath
+        }
+        return env
     }
 
     override fun getBindMounts(): List<Pair<String, String>> {
-        val tmpDir = File(getRootfsDirectory(), "tmp")
-        if (!tmpDir.exists()) tmpDir.mkdirs()
+        val rootfs = getRootfsDirectory()
+        val tmpHost = File(rootfs, "tmp")
+        if (!tmpHost.exists()) tmpHost.mkdirs()
         return listOf(
-            tmpDir.absolutePath to "/dev/shm"
+            tmpHost.absolutePath to "/dev/shm"
         )
     }
 
@@ -74,14 +93,14 @@ class StandaloneRuntimeProvider(private val context: Context) : LinuxRuntimeProv
             val etcDir = File(rootfs, "etc")
             if (!etcDir.exists()) etcDir.mkdirs()
             val resolv = File(etcDir, "resolv.conf")
-            if (!resolv.exists()) {
-                resolv.writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+            if (!resolv.exists() || resolv.length() == 0L) {
+                resolv.writeText("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
             }
 
             // 2. Setup /etc/hosts
             val hosts = File(etcDir, "hosts")
-            if (!hosts.exists()) {
-                hosts.writeText("127.0.0.1 localhost ubuntu\n")
+            if (!hosts.exists() || hosts.length() == 0L) {
+                hosts.writeText("127.0.0.1 localhost ubuntu\n::1 localhost ip6-localhost ip6-loopback\n")
             }
 
             // 3. Fix APT sandbox drop permissions (_apt error under PRoot)
