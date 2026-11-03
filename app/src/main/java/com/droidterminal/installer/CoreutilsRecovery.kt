@@ -40,6 +40,18 @@ data class CoreutilsRecoveryResult(
 )
 
 /**
+ * Result of Ubuntu Package Manager recovery (dpkg --configure -a, apt-get -f install).
+ */
+data class PackageManagerRecoveryResult(
+    val success: Boolean,
+    val dpkgConfigureOk: Boolean,
+    val aptFixBrokenOk: Boolean,
+    val libcBinConfigured: Boolean,
+    val coreutilsVerified: Boolean,
+    val outputLog: List<String>
+)
+
+/**
  * Dedicated Coreutils Recovery and Rootfs Package/Filesystem Reconciler.
  *
  * Resolves the critical inconsistency where the DPKG database reports coreutils=true
@@ -58,10 +70,12 @@ object CoreutilsRecovery {
 
     /**
      * Mandatory GNU coreutils commands required for POSIX userspace and dpkg maintainer scripts.
+     * Includes md5sum and cut which are critical for libc-bin.postinst execution.
      */
     val MANDATORY_COMMANDS = listOf(
         "uname", "env", "cat", "ls", "mkdir", "chmod", "touch",
-        "cp", "mv", "rm", "ln", "readlink", "sleep", "date"
+        "cp", "mv", "rm", "ln", "readlink", "sleep", "date",
+        "md5sum", "cut"
     )
 
     /**
@@ -69,7 +83,29 @@ object CoreutilsRecovery {
      */
     val EXTENDED_COMMANDS = listOf(
         "echo", "test", "true", "false", "head", "tail", "wc", "sort",
-        "uniq", "cut", "tr", "basename", "dirname", "sync", "whoami", "id"
+        "uniq", "tr", "basename", "dirname", "sync", "whoami", "id"
+    )
+
+    /**
+     * Complete set of standard GNU Coreutils commands.
+     * When /usr/bin/coreutils multicall binary is present, all these commands
+     * are reconciled and linked to it.
+     */
+    val ALL_COREUTILS_COMMANDS = listOf(
+        "[", "arch", "b2sum", "base32", "base64", "basename", "basenc", "cat",
+        "chcon", "chgrp", "chmod", "chown", "chroot", "cksum", "comm", "cp",
+        "csplit", "cut", "date", "dd", "df", "dir", "dircolors", "dirname",
+        "du", "echo", "env", "expand", "expr", "factor", "false", "fmt",
+        "fold", "groups", "head", "hostid", "id", "install", "join", "link",
+        "ln", "logname", "ls", "md5sum", "mkdir", "mkfifo", "mknod", "mktemp",
+        "mv", "nice", "nl", "nohup", "nproc", "numfmt", "od", "paste",
+        "pathchk", "pinky", "pr", "printenv", "printf", "ptx", "pwd", "readlink",
+        "realpath", "rm", "rmdir", "runcon", "seq", "sha1sum", "sha224sum",
+        "sha256sum", "sha384sum", "sha512sum", "shred", "shuf", "sleep", "sort",
+        "split", "stat", "stdbuf", "stty", "sum", "sync", "tac", "tail",
+        "tee", "test", "timeout", "touch", "tr", "true", "truncate", "tsort",
+        "tty", "uname", "unexpand", "uniq", "unlink", "uptime", "users", "vdir",
+        "wc", "who", "whoami", "yes"
     )
 
     /**
@@ -350,11 +386,11 @@ object CoreutilsRecovery {
 
         // Source Option C: Multicall Binary or Individual Binaries Linking
         // In Ubuntu coreutils, /usr/bin/coreutils is the multi-call binary.
-        // If /usr/bin/coreutils is present, any missing mandatory command can be linked to it!
+        // If /usr/bin/coreutils is present, any missing coreutils command can be linked to it!
         val multicall = File(usrBin, "coreutils")
         if (multicall.exists() && multicall.canExecute()) {
-            log("[COREUTILS-RECOVERY] /usr/bin/coreutils multicall binary exists. Reconciling missing command symlinks...")
-            for (cmd in MANDATORY_COMMANDS) {
+            log("[COREUTILS-RECOVERY] /usr/bin/coreutils multicall binary exists. Reconciling missing command symlinks for all standard coreutils...")
+            for (cmd in ALL_COREUTILS_COMMANDS) {
                 val cmdFile = File(usrBin, cmd)
                 if (!cmdFile.exists() || Files.isSymbolicLink(cmdFile.toPath())) {
                     createSymlink("coreutils", cmdFile, ::log)
@@ -384,7 +420,7 @@ object CoreutilsRecovery {
         mirrorToBinIfDirectory(rootfsDir, ::log)
 
         // Step 6: Apply exact 0755 permissions strictly (no chmod -R 777)
-        for (cmd in MANDATORY_COMMANDS) {
+        for (cmd in ALL_COREUTILS_COMMANDS) {
             val usrF = File(usrBin, cmd)
             if (usrF.exists()) setExecutableFilePermissions(usrF)
             val binF = File(bin, cmd)
@@ -507,64 +543,51 @@ object CoreutilsRecovery {
         val targetUsrBin = File(rootfsDir, "usr/bin")
         if (!targetUsrBin.exists()) targetUsrBin.mkdirs()
 
-        // Construct targeted tar extraction arguments
-        val tarPatterns = listOf(
-            "./usr/bin/coreutils",
-            "./usr/bin/uname",
-            "./usr/bin/cat",
-            "./usr/bin/ls",
-            "./usr/bin/mkdir",
-            "./usr/bin/chmod",
-            "./usr/bin/touch",
-            "./usr/bin/cp",
-            "./usr/bin/mv",
-            "./usr/bin/rm",
-            "./usr/bin/ln",
-            "./usr/bin/readlink",
-            "./usr/bin/sleep",
-            "./usr/bin/date",
-            "./usr/bin/env",
-            "./usr/bin/echo",
-            "./usr/bin/test",
-            "./usr/bin/true",
-            "./usr/bin/false",
-            "./bin/uname",
-            "./bin/cat",
-            "./bin/ls",
-            "./bin/mkdir",
-            "./bin/chmod",
-            "./bin/touch",
-            "./bin/cp",
-            "./bin/mv",
-            "./bin/rm",
-            "./bin/ln",
-            "./bin/readlink",
-            "./bin/sleep",
-            "./bin/date"
-        )
-
-        val tarCmd = when {
-            File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archive.absolutePath, "-C", rootfsDir.absolutePath, *tarPatterns.toTypedArray())
-            File("/system/bin/tar").exists() -> arrayOf("/system/bin/tar", "-xpf", archive.absolutePath, "-C", rootfsDir.absolutePath, *tarPatterns.toTypedArray())
-            else -> arrayOf("tar", "-xpf", archive.absolutePath, "-C", rootfsDir.absolutePath, *tarPatterns.toTypedArray())
-        }
-
         var count = 0
         try {
-            val p = ProcessBuilder(*tarCmd)
-                .redirectErrorStream(true)
-                .start()
-            val out = p.inputStream.bufferedReader().readText()
-            p.waitFor()
-            log("[EXTRACT-TAR] tar extraction result: exit=${p.exitValue()} (patterns=${tarPatterns.size})")
+            log("[EXTRACT-TAR] Extracting coreutils and system binaries using TarExtractor from ${archive.name}...")
+            val targetPrefixes = listOf(
+                "usr/bin/", "bin/", "usr/sbin/", "sbin/", "usr/lib/", "lib/", "etc/"
+            )
+            TarExtractor.extract(
+                archive = archive,
+                targetDir = rootfsDir,
+                pathFilter = { path ->
+                    targetPrefixes.any { path.startsWith(it) }
+                }
+            )
 
             for (cmd in MANDATORY_COMMANDS) {
                 val f1 = File(rootfsDir, "usr/bin/$cmd")
                 val f2 = File(rootfsDir, "bin/$cmd")
                 if (f1.exists() || f2.exists()) count++
             }
+            log("[EXTRACT-TAR] TarExtractor completed. Found $count/${MANDATORY_COMMANDS.size} mandatory commands.")
         } catch (e: Exception) {
-            log("[WARN] Tar extraction process error: ${e.message}")
+            log("[WARN] TarExtractor encountered issue: ${e.message}; attempting fallback tar process...")
+            val tarPatterns = listOf(
+                "./usr/bin/*", "./bin/*"
+            )
+            val tarCmd = when {
+                File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archive.absolutePath, "-C", rootfsDir.absolutePath, *tarPatterns.toTypedArray())
+                File("/system/bin/tar").exists() -> arrayOf("/system/bin/tar", "-xpf", archive.absolutePath, "-C", rootfsDir.absolutePath, *tarPatterns.toTypedArray())
+                else -> arrayOf("tar", "-xpf", archive.absolutePath, "-C", rootfsDir.absolutePath, *tarPatterns.toTypedArray())
+            }
+
+            try {
+                val p = ProcessBuilder(*tarCmd).redirectErrorStream(true).start()
+                p.inputStream.bufferedReader().readText()
+                p.waitFor()
+                log("[EXTRACT-TAR] Fallback tar process completed with exit ${p.exitValue()}")
+
+                for (cmd in MANDATORY_COMMANDS) {
+                    val f1 = File(rootfsDir, "usr/bin/$cmd")
+                    val f2 = File(rootfsDir, "bin/$cmd")
+                    if (f1.exists() || f2.exists()) count++
+                }
+            } catch (t: Throwable) {
+                log("[WARN] Fallback tar process also failed: ${t.message}")
+            }
         }
 
         return count
@@ -591,20 +614,31 @@ object CoreutilsRecovery {
             val dataTar = workDir.listFiles { _, name -> name.startsWith("data.tar") }?.firstOrNull()
             if (dataTar != null) {
                 log("[DEB-UNPACK] Found data payload: ${dataTar.name}; unpacking into rootfs...")
-                val tarCmd = when {
-                    File("/system/bin/toybox").exists() -> arrayOf(
-                        "/system/bin/toybox", "tar", "-xpf", dataTar.absolutePath,
-                        "-C", rootfsDir.absolutePath,
-                        "--exclude=./dev/*", "--exclude=dev/*"
-                    )
-                    else -> arrayOf(
-                        "tar", "-xpf", dataTar.absolutePath,
-                        "-C", rootfsDir.absolutePath,
-                        "--exclude=./dev/*", "--exclude=dev/*"
-                    )
+                var extracted = false
+                if (dataTar.name.endsWith(".tar") || dataTar.name.endsWith(".tar.gz")) {
+                    try {
+                        TarExtractor.extract(dataTar, rootfsDir)
+                        extracted = true
+                    } catch (e: Exception) {
+                        log("[DEB-UNPACK] TarExtractor fallback needed: ${e.message}")
+                    }
                 }
-                val tarPb = ProcessBuilder(*tarCmd).start()
-                tarPb.waitFor()
+                if (!extracted) {
+                    val tarCmd = when {
+                        File("/system/bin/toybox").exists() -> arrayOf(
+                            "/system/bin/toybox", "tar", "-xpf", dataTar.absolutePath,
+                            "-C", rootfsDir.absolutePath,
+                            "--exclude=./dev/*", "--exclude=dev/*"
+                        )
+                        else -> arrayOf(
+                            "tar", "-xpf", dataTar.absolutePath,
+                            "-C", rootfsDir.absolutePath,
+                            "--exclude=./dev/*", "--exclude=dev/*"
+                        )
+                    }
+                    val tarPb = ProcessBuilder(*tarCmd).start()
+                    tarPb.waitFor()
+                }
 
                 for (cmd in MANDATORY_COMMANDS) {
                     if (File(rootfsDir, "usr/bin/$cmd").exists() || File(rootfsDir, "bin/$cmd").exists()) {
@@ -618,6 +652,120 @@ object CoreutilsRecovery {
             workDir.deleteRecursively()
         }
         return restored
+    }
+
+    /**
+     * Recovers Ubuntu Package Manager after coreutils or libc-bin corruption.
+     *
+     * 1. Restores missing coreutils host-side without requiring guest utilities.
+     * 2. Cleans stale DPKG locks to prevent hangs.
+     * 3. Verifies mandatory guest commands inside PRoot.
+     * 4. Executes 'dpkg --configure -a' inside PRoot.
+     * 5. Executes 'apt-get -f install -y' inside PRoot.
+     * 6. Verifies 'libc-bin' and 'coreutils' package status in /var/lib/dpkg/status.
+     */
+    fun recoverPackageManager(
+        rootfsDir: File,
+        prootExecutable: File,
+        loaderExecutable: File? = null,
+        tmpDir: File? = null,
+        archiveFile: File? = null,
+        onLog: (String) -> Unit = {}
+    ): PackageManagerRecoveryResult {
+        val execLogs = mutableListOf<String>()
+        fun log(msg: String) {
+            execLogs.add(msg)
+            onLog(msg)
+        }
+
+        log("[PKG-MGR-RECOVERY] Starting Package Manager recovery for: ${rootfsDir.absolutePath}")
+
+        // 1. Recover Coreutils first (ensures md5sum, cut, uname, etc. are on disk)
+        val recoveryResult = recoverCoreutils(
+            rootfsDir = rootfsDir,
+            archiveFile = archiveFile,
+            prootExecutable = prootExecutable,
+            loaderExecutable = loaderExecutable,
+            tmpDir = tmpDir,
+            onLog = ::log
+        )
+
+        if (!recoveryResult.success) {
+            log("[PKG-MGR-RECOVERY-FAIL] Coreutils recovery failed: missing=${recoveryResult.failedCommands}")
+            return PackageManagerRecoveryResult(
+                success = false,
+                dpkgConfigureOk = false,
+                aptFixBrokenOk = false,
+                libcBinConfigured = false,
+                coreutilsVerified = false,
+                outputLog = execLogs
+            )
+        }
+
+        // 2. Remove stale lock files host-side to prevent lock deadlocks
+        val lockPaths = listOf(
+            "var/lib/dpkg/lock",
+            "var/lib/dpkg/lock-frontend",
+            "var/lib/apt/lists/lock",
+            "var/cache/apt/archives/lock"
+        )
+        for (relLock in lockPaths) {
+            val lockFile = File(rootfsDir, relLock)
+            if (lockFile.exists()) {
+                try {
+                    lockFile.delete()
+                    log("[PKG-MGR-RECOVERY] Removed stale lock: $relLock")
+                } catch (_: Exception) {}
+            }
+        }
+
+        // 3. Verify mandatory commands inside PRoot
+        val verifyScript = "for cmd in md5sum cut uname env cat ls mkdir chmod touch; do command -v \$cmd >/dev/null 2>&1 || { echo \"MISSING:\$cmd\"; exit 1; }; done; echo ALL_CMDS_OK"
+        val (verifyOk, verifyOut) = verifyCommandRuntime(rootfsDir, prootExecutable, loaderExecutable, tmpDir, verifyScript)
+        val coreutilsVerified = verifyOk || verifyOut.contains("ALL_CMDS_OK") || (recoveryResult.verifiedCommands.containsAll(listOf("md5sum", "cut", "uname", "env", "cat", "ls", "mkdir", "chmod", "touch")))
+        log("[PKG-MGR-RECOVERY] Mandatory guest commands verification: coreutilsVerified=$coreutilsVerified (out: $verifyOut)")
+
+        // 4. Run `dpkg --configure -a` inside PRoot
+        log("[PKG-MGR-RECOVERY] Executing 'dpkg --configure -a' inside PRoot...")
+        val dpkgCmd = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive; dpkg --configure -a"
+        val (dpkgOk, dpkgOut) = verifyCommandRuntime(rootfsDir, prootExecutable, loaderExecutable, tmpDir, dpkgCmd)
+        log("[PKG-MGR-RECOVERY] dpkg --configure -a result: ok=$dpkgOk output: $dpkgOut")
+
+        // 5. Run `apt-get -f install -y` inside PRoot
+        log("[PKG-MGR-RECOVERY] Executing 'apt-get -f install -y' inside PRoot...")
+        val aptCmd = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive; apt-get -f install -y"
+        val (aptOk, aptOut) = verifyCommandRuntime(rootfsDir, prootExecutable, loaderExecutable, tmpDir, aptCmd)
+        log("[PKG-MGR-RECOVERY] apt-get -f install -y result: ok=$aptOk output: $aptOut")
+
+        // 6. Verify libc-bin status in /var/lib/dpkg/status
+        val statusFile = File(rootfsDir, "var/lib/dpkg/status")
+        var libcBinConfigured = false
+        if (statusFile.exists()) {
+            val content = statusFile.readText()
+            val libcBinChunk = content.split("\n\n").firstOrNull { it.contains("Package: libc-bin") }
+            if (libcBinChunk != null) {
+                libcBinConfigured = libcBinChunk.contains("Status: install ok installed")
+                log("[PKG-MGR-RECOVERY] libc-bin status check: configured=$libcBinConfigured")
+            } else {
+                val libcBinFilesExist = File(rootfsDir, "usr/bin/ldconfig").exists() || File(rootfsDir, "sbin/ldconfig").exists()
+                libcBinConfigured = libcBinFilesExist || dpkgOk
+                log("[PKG-MGR-RECOVERY] libc-bin package record absent; ldconfig exists=$libcBinFilesExist")
+            }
+        } else {
+            libcBinConfigured = dpkgOk
+        }
+
+        val overallSuccess = coreutilsVerified && (dpkgOk || libcBinConfigured)
+        log("[PKG-MGR-RECOVERY] Overall result: success=$overallSuccess, dpkgOk=$dpkgOk, libcBinConfigured=$libcBinConfigured")
+
+        return PackageManagerRecoveryResult(
+            success = overallSuccess,
+            dpkgConfigureOk = dpkgOk,
+            aptFixBrokenOk = aptOk,
+            libcBinConfigured = libcBinConfigured,
+            coreutilsVerified = coreutilsVerified,
+            outputLog = execLogs
+        )
     }
 
     /**

@@ -594,8 +594,8 @@ class UbuntuInstaller(
     }
 
     /**
-     * Extracts rootfs tarball using toybox tar with fallback to system tar, preserving symlinks.
-     * Excludes static ./dev device nodes which cannot be created in unprivileged Android apps.
+     * Extracts rootfs tarball using pure-Java TarExtractor (which translates hardlinks to symlinks
+     * and skips unprivileged dev nodes), with fallback to system tar.
      */
     private fun extractArchive(archive: File, targetDir: File) {
         if (!targetDir.exists()) targetDir.mkdirs()
@@ -603,31 +603,43 @@ class UbuntuInstaller(
             throw IOException("Extraction target directory does not exist or is not a directory: ${targetDir.absolutePath}")
         }
 
-        val devExcludes = arrayOf("--exclude=./dev/*", "--exclude=dev/*", "--exclude=./dev", "--exclude=dev")
-        val tarCmd = when {
-            File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
-            File("/system/bin/tar").exists() -> arrayOf("/system/bin/tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
-            else -> arrayOf("tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
+        var tarExtractorSucceeded = false
+        try {
+            val extractedEntries = TarExtractor.extract(archive, targetDir)
+            if (extractedEntries > 100) {
+                tarExtractorSucceeded = true
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("UbuntuInstaller", "TarExtractor encountered error, falling back to system tar: ${e.message}")
         }
 
-        val process = ProcessBuilder(*tarCmd)
-            .redirectErrorStream(true)
-            .start()
+        if (!tarExtractorSucceeded) {
+            val devExcludes = arrayOf("--exclude=./dev/*", "--exclude=dev/*", "--exclude=./dev", "--exclude=dev")
+            val tarCmd = when {
+                File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
+                File("/system/bin/tar").exists() -> arrayOf("/system/bin/tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
+                else -> arrayOf("tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
+            }
 
-        val reader = BufferedReader(InputStreamReader(process.inputStream))
-        while (reader.readLine() != null) {
-            // Drain output
+            val process = ProcessBuilder(*tarCmd)
+                .redirectErrorStream(true)
+                .start()
+
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            while (reader.readLine() != null) {
+                // Drain output
+            }
+            val exitCode = process.waitFor()
         }
-        val exitCode = process.waitFor()
 
         // Post-extraction verification: ensure shell and essential coreutils exist
         val bash = File(targetDir, "bin/bash")
         val usrBash = File(targetDir, "usr/bin/bash")
         if (!bash.exists() && !usrBash.exists()) {
-            throw IllegalStateException("Tar extraction failed (exit code $exitCode): /bin/bash is missing from extracted rootfs.")
+            throw IllegalStateException("Root filesystem extraction failed: /bin/bash is missing from extracted rootfs.")
         }
 
-        // Post-extraction check for coreutils commands (uname, cat, ls, etc.)
+        // Post-extraction check for coreutils commands (uname, cat, ls, md5sum, cut, etc.)
         val usrUname = File(targetDir, "usr/bin/uname")
         val binUname = File(targetDir, "bin/uname")
         if (!usrUname.exists() && !binUname.exists()) {
@@ -1259,7 +1271,18 @@ class UbuntuInstaller(
     fun retryDpkgPackageConfiguration(archiveFile: File? = null): Pair<Int, String> {
         val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
         val loader = activeLoaderFile ?: assetsManager.resolveLoader()
+        // Ensure package manager state is reconciled and mandatory commands exist
+        CoreutilsRecovery.recoverPackageManager(rootfsDir, proot, loader, tmpDir, archiveFile)
         return PreUpgradeHealthCheck.retryPackageConfiguration(rootfsDir, proot, loader, tmpDir, archiveFile)
+    }
+
+    /**
+     * Recovers Ubuntu Package Manager state (dpkg --configure -a, apt-get -f install).
+     */
+    fun recoverPackageManager(archiveFile: File? = null): PackageManagerRecoveryResult {
+        val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
+        val loader = activeLoaderFile ?: assetsManager.resolveLoader()
+        return CoreutilsRecovery.recoverPackageManager(rootfsDir, proot, loader, tmpDir, archiveFile)
     }
 
     /**

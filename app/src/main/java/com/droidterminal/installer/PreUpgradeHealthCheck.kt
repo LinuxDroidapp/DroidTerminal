@@ -23,8 +23,13 @@ data class HealthCheckResult(
     val dpkgStatusOk: Boolean,
     val usrMergeOk: Boolean,
     val bindMountsOk: Boolean,
+    val dynamicLinkerOk: Boolean = true,
+    val sharedLibraryOk: Boolean = true,
+    val writeAccessOk: Boolean = true,
+    val brokenSymlinksOk: Boolean = true,
     val unameOutput: String,
     val missingCommands: List<String>,
+    val brokenSymlinks: List<String> = emptyList(),
     val details: String
 ) {
     val checks: Map<String, Boolean>
@@ -35,7 +40,11 @@ data class HealthCheckResult(
             "coreutils" to coreutilsOk,
             "dpkgStatus" to dpkgStatusOk,
             "usrMerge" to usrMergeOk,
-            "bindMounts" to bindMountsOk
+            "bindMounts" to bindMountsOk,
+            "dynamicLinker" to dynamicLinkerOk,
+            "sharedLibrary" to sharedLibraryOk,
+            "writeAccess" to writeAccessOk,
+            "brokenSymlinks" to brokenSymlinksOk
         )
 }
 
@@ -64,12 +73,12 @@ object PreUpgradeHealthCheck {
 
     /**
      * Essential coreutils and system commands required by POSIX userspace and dpkg maintainer scripts.
-     * Contains all 14 mandatory commands requested by specification.
+     * Contains all mandatory commands including md5sum and cut for libc-bin.postinst.
      */
     val ESSENTIAL_COMMANDS = listOf(
         "uname", "env", "cat", "ls", "mkdir", "chmod", "touch",
         "cp", "mv", "rm", "ln", "readlink", "sleep", "date",
-        "echo", "test", "true"
+        "echo", "test", "true", "md5sum", "cut"
     )
 
     /**
@@ -329,7 +338,65 @@ object PreUpgradeHealthCheck {
             diag.appendLine("[WARN] /var/lib/dpkg/status missing or empty")
         }
 
-        val isHealthy = unameOk && shOk && bashOk && coreutilsOk && linkerOk && dpkgStatusOk
+        // 8. Essential Shared Library Check (libc.so.6)
+        val libcFile = listOf(
+            File(rootfsDir, "lib/aarch64-linux-gnu/libc.so.6"),
+            File(rootfsDir, "usr/lib/aarch64-linux-gnu/libc.so.6"),
+            File(rootfsDir, "lib/libc.so.6"),
+            File(rootfsDir, "usr/lib/libc.so.6")
+        ).firstOrNull { it.exists() }
+        val sharedLibOk = libcFile != null
+        if (!sharedLibOk) {
+            diag.appendLine("[ERROR] Essential shared library libc.so.6 not found in rootfs")
+        } else {
+            diag.appendLine("[CHECK] Shared library libc.so.6: OK (${libcFile.relativeTo(rootfsDir)})")
+        }
+
+        // 9. Broken Symlinks Audit in System Binary Directories
+        val brokenSymlinksList = mutableListOf<String>()
+        val dirsToCheck = listOf(File(rootfsDir, "bin"), File(rootfsDir, "usr/bin"), File(rootfsDir, "sbin"), File(rootfsDir, "usr/sbin"))
+        for (d in dirsToCheck) {
+            if (d.exists() && d.isDirectory && !Files.isSymbolicLink(d.toPath())) {
+                d.listFiles()?.forEach { f ->
+                    if (Files.isSymbolicLink(f.toPath())) {
+                        val target = try { Files.readSymbolicLink(f.toPath()) } catch (_: Exception) { null }
+                        val resolved = if (target != null) {
+                            if (target.isAbsolute) File(rootfsDir, target.toString().removePrefix("/"))
+                            else File(f.parentFile, target.toString())
+                        } else null
+                        if (resolved == null || !resolved.exists()) {
+                            brokenSymlinksList.add(f.relativeTo(rootfsDir).path)
+                        }
+                    }
+                }
+            }
+        }
+        val brokenSymlinksOk = brokenSymlinksList.isEmpty()
+        if (!brokenSymlinksOk) {
+            diag.appendLine("[WARN] Detected ${brokenSymlinksList.size} broken symlinks in binary dirs: $brokenSymlinksList")
+        } else {
+            diag.appendLine("[CHECK] System binary symlinks: OK (no broken symlinks)")
+        }
+
+        // 10. Rootfs Write Access Check (/tmp, /var/tmp, /root)
+        var writeAccessOk = true
+        val probeDirs = listOf(File(rootfsDir, "tmp"), File(rootfsDir, "var/tmp"), File(rootfsDir, "root"))
+        for (dir in probeDirs) {
+            if (!dir.exists()) dir.mkdirs()
+            val probe = File(dir, ".probe_write_${System.currentTimeMillis()}")
+            try {
+                probe.writeText("ok")
+                probe.delete()
+            } catch (t: Throwable) {
+                writeAccessOk = false
+                diag.appendLine("[ERROR] Rootfs directory not writable: ${dir.relativeTo(rootfsDir)} (${t.message})")
+            }
+        }
+        if (writeAccessOk) {
+            diag.appendLine("[CHECK] Rootfs write access (/tmp, /var/tmp, /root): OK")
+        }
+
+        val isHealthy = unameOk && shOk && bashOk && coreutilsOk && linkerOk && dpkgStatusOk && sharedLibOk && writeAccessOk
 
         return HealthCheckResult(
             isHealthy = isHealthy,
@@ -340,8 +407,13 @@ object PreUpgradeHealthCheck {
             dpkgStatusOk = dpkgStatusOk,
             usrMergeOk = usrMergeOk,
             bindMountsOk = true,
+            dynamicLinkerOk = linkerOk,
+            sharedLibraryOk = sharedLibOk,
+            writeAccessOk = writeAccessOk,
+            brokenSymlinksOk = brokenSymlinksOk,
             unameOutput = unameOutput,
             missingCommands = missingCmds,
+            brokenSymlinks = brokenSymlinksList,
             details = diag.toString()
         )
     }

@@ -10,6 +10,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
 
 class UbuntuInstallerTest {
 
@@ -60,6 +61,10 @@ class UbuntuInstallerTest {
         val linker = File(lib, "ld-linux-aarch64.so.1")
         linker.writeText("ELF-INTERPRETER-MOCK")
         installer.setExecutablePermissions(linker)
+
+        val libc = File(lib, "libc.so.6")
+        libc.writeText("LIBC-MOCK")
+        installer.setExecutablePermissions(libc)
     }
 
     // =========================================================================
@@ -1108,5 +1113,258 @@ class UbuntuInstallerTest {
         // 3. Application restart simulation: create a new UbuntuInstaller instance with the same filesDir
         val restartedInstaller = UbuntuInstaller(context = null, customFilesDir = freshFilesDir)
         assertTrue("Restarted installer instance must recognize existing persistent rootfs", restartedInstaller.isInstalled())
+    }
+
+    /**
+     * Test J: libc-bin.postinst simulation with md5sum and cut.
+     * Simulates the exact failure:
+     *   /var/lib/dpkg/info/libc-bin.postinst: 1: md5sum: not found
+     *   /var/lib/dpkg/info/libc-bin.postinst: 1: cut: not found
+     * Verifies that missing md5sum/cut fails maintainer script, and after CoreutilsRecovery
+     * the maintainer script succeeds with exit 0.
+     */
+    @Test
+    fun testLibcBinPostinstSimulationWithMd5sumAndCut() {
+        val rootfsDir = tempFolder.newFolder("libc_bin_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val binDir = File(rootfsDir, "bin").apply { mkdirs() }
+        val infoDir = File(rootfsDir, "var/lib/dpkg/info").apply { mkdirs() }
+
+        // Create libc-bin.postinst script requiring md5sum and cut
+        val postinst = File(infoDir, "libc-bin.postinst")
+        postinst.writeText(
+            """
+            #!/bin/sh
+            set -e
+            HASH=${'$'}(echo "dummy-data" | md5sum | cut -d' ' -f1)
+            if [ -z "${'$'}HASH" ]; then
+                exit 1
+            fi
+            echo "LIBC_BIN_CONFIGURED_OK:${'$'}HASH"
+            exit 0
+            """.trimIndent() + "\n"
+        )
+        postinst.setExecutable(true)
+
+        // Setup mock coreutils multicall binary
+        val multicall = File(usrBin, "coreutils").apply {
+            writeText(
+                """
+                #!/bin/sh
+                cmd=${'$'}(basename "${'$'}0")
+                if [ "${'$'}cmd" = "md5sum" ]; then
+                    echo "d41d8cd98f00b204e9800998ecf8427e  -"
+                    exit 0
+                fi
+                if [ "${'$'}cmd" = "cut" ]; then
+                    read line
+                    echo "${'$'}line" | tr -s ' ' | awk '{print ${'$'}1}'
+                    exit 0
+                fi
+                exit 0
+                """.trimIndent() + "\n"
+            )
+            setExecutable(true)
+        }
+
+        // Before recovery: md5sum and cut are NOT symlinked
+        assertFalse("md5sum must not exist initially", File(usrBin, "md5sum").exists())
+        assertFalse("cut must not exist initially", File(usrBin, "cut").exists())
+
+        // Run recovery
+        val result = CoreutilsRecovery.recoverCoreutils(rootfsDir)
+        assertTrue("Coreutils recovery must succeed", result.success)
+
+        // After recovery: md5sum and cut must exist and be executable
+        val md5sumFile = File(usrBin, "md5sum")
+        val cutFile = File(usrBin, "cut")
+        assertTrue("md5sum must exist in /usr/bin", md5sumFile.exists())
+        assertTrue("cut must exist in /usr/bin", cutFile.exists())
+        assertTrue("md5sum must be executable", md5sumFile.canExecute())
+        assertTrue("cut must be executable", cutFile.canExecute())
+
+        // Execute postinst script with PATH pointing to rootfs usr/bin
+        val pb = ProcessBuilder("/bin/sh", postinst.absolutePath)
+        pb.environment()["PATH"] = "${usrBin.absolutePath}:${binDir.absolutePath}:/usr/bin:/bin"
+        val proc = pb.start()
+        val out = proc.inputStream.bufferedReader().readText()
+        val exit = proc.waitFor()
+
+        assertEquals("libc-bin.postinst must succeed with exit code 0", 0, exit)
+        assertTrue("libc-bin.postinst must output confirmation", out.contains("LIBC_BIN_CONFIGURED_OK"))
+    }
+
+    /**
+     * Test K: TarExtractor automatically translates hardlinks into symlinks or copies,
+     * and skips device nodes without failing.
+     */
+    @Test
+    fun testTarExtractorHardlinkTranslation() {
+        val testDir = tempFolder.newFolder("tar_extract_test")
+        val targetDir = File(testDir, "dest").apply { mkdirs() }
+        val tarFile = File(testDir, "test.tar")
+
+        // Build a minimal POSIX tar archive with:
+        // 1. Regular file: usr/bin/coreutils
+        // 2. Hardlink: usr/bin/md5sum -> usr/bin/coreutils (typeflag '1')
+        // 3. Hardlink: usr/bin/cut -> usr/bin/coreutils (typeflag '1')
+        // 4. Device node: dev/null (typeflag '3')
+        java.io.FileOutputStream(tarFile).use { fos ->
+            val coreutilsContent = "#!/bin/sh\necho COREUTILS_OK\n".toByteArray()
+
+            // Header 1: usr/bin/coreutils (regular file)
+            writeTarHeader(fos, "usr/bin/coreutils", '0', coreutilsContent.size.toLong(), 493, "")
+            fos.write(coreutilsContent)
+            writeTarPadding(fos, coreutilsContent.size)
+
+            // Header 2: usr/bin/md5sum (hardlink to usr/bin/coreutils)
+            writeTarHeader(fos, "usr/bin/md5sum", '1', 0L, 493, "usr/bin/coreutils")
+
+            // Header 3: usr/bin/cut (hardlink to usr/bin/coreutils)
+            writeTarHeader(fos, "usr/bin/cut", '1', 0L, 493, "usr/bin/coreutils")
+
+            // Header 4: dev/null (char device - should be ignored)
+            writeTarHeader(fos, "dev/null", '3', 0L, 438, "")
+
+            // End of archive (two 512-byte zero blocks)
+            fos.write(ByteArray(1024))
+        }
+
+        // Extract using TarExtractor
+        val count = TarExtractor.extract(tarFile, targetDir)
+        assertTrue("Extracted entry count should be >= 3", count >= 3)
+
+        val coreutilsFile = File(targetDir, "usr/bin/coreutils")
+        val md5sumFile = File(targetDir, "usr/bin/md5sum")
+        val cutFile = File(targetDir, "usr/bin/cut")
+        val devNull = File(targetDir, "dev/null")
+
+        assertTrue("usr/bin/coreutils must exist", coreutilsFile.exists())
+        assertTrue("usr/bin/md5sum must exist (translated hardlink)", md5sumFile.exists())
+        assertTrue("usr/bin/cut must exist (translated hardlink)", cutFile.exists())
+        assertTrue("usr/bin/md5sum must be executable", md5sumFile.canExecute())
+        assertTrue("usr/bin/cut must be executable", cutFile.canExecute())
+        assertFalse("dev/null device node must be skipped", devNull.exists())
+    }
+
+    /**
+     * Test L: PackageManagerRecovery cleans stale locks, reconciles dpkg status,
+     * and confirms libc-bin configured.
+     */
+    @Test
+    fun testPackageManagerRecoveryAndLibcBinStatus() {
+        val rootfsDir = tempFolder.newFolder("pkg_mgr_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val dpkgDir = File(rootfsDir, "var/lib/dpkg").apply { mkdirs() }
+        val aptDir = File(rootfsDir, "var/lib/apt/lists").apply { mkdirs() }
+
+        // Create stale locks
+        val dpkgLock = File(dpkgDir, "lock").apply { writeText("stale-lock") }
+        val aptLock = File(aptDir, "lock").apply { writeText("stale-lock") }
+        assertTrue("DPKG lock must exist before recovery", dpkgLock.exists())
+        assertTrue("APT lock must exist before recovery", aptLock.exists())
+
+        // Create mock multicall coreutils
+        File(usrBin, "coreutils").apply {
+            writeText("#!/bin/sh\nexit 0\n")
+            setExecutable(true)
+        }
+
+        // Setup mock dpkg status with unconfigured libc-bin
+        val statusFile = File(dpkgDir, "status")
+        statusFile.writeText(
+            """
+            Package: libc-bin
+            Status: install ok half-configured
+            Architecture: arm64
+            Version: 2.39-0ubuntu8
+
+            """.trimIndent() + "\n"
+        )
+
+        // Mock ldconfig
+        File(usrBin, "ldconfig").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+
+        val result = CoreutilsRecovery.recoverPackageManager(
+            rootfsDir = rootfsDir,
+            prootExecutable = assetProot
+        )
+
+        assertFalse("DPKG lock must be removed", dpkgLock.exists())
+        assertFalse("APT lock must be removed", aptLock.exists())
+        assertTrue("Coreutils must be verified", result.coreutilsVerified)
+        assertTrue("Recovery must succeed", result.success)
+    }
+
+    /**
+     * Test M: Enhanced health check detects broken symlinks, missing libc.so.6,
+     * and unwritable directories.
+     */
+    @Test
+    fun testEnhancedHealthCheckDetectsBrokenSymlinksAndMissingLibraries() {
+        val rootfsDir = tempFolder.newFolder("health_check_enhanced_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val libDir = File(rootfsDir, "lib").apply { mkdirs() }
+
+        // Setup sh and bash
+        File(usrBin, "sh").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+        File(usrBin, "bash").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+        File(usrBin, "uname").apply { writeText("#!/bin/sh\necho aarch64\n"); setExecutable(true) }
+        File(libDir, "ld-linux-aarch64.so.1").apply { writeText("LINKER"); setExecutable(true) }
+
+        // Missing libc.so.6: health check should flag sharedLibraryOk = false
+        val resultNoLibc = PreUpgradeHealthCheck.checkRootfsHealth(
+            rootfsDir = rootfsDir,
+            prootExecutable = assetProot
+        )
+        assertFalse("Health check must report sharedLibraryOk = false when libc.so.6 is missing", resultNoLibc.sharedLibraryOk)
+
+        // Add libc.so.6
+        File(libDir, "libc.so.6").apply { writeText("LIBC"); setExecutable(true) }
+
+        // Create a broken symlink in usr/bin
+        val brokenLink = File(usrBin, "broken_tool")
+        Files.createSymbolicLink(brokenLink.toPath(), java.nio.file.Paths.get("non_existent_binary"))
+
+        val resultWithBrokenLink = PreUpgradeHealthCheck.checkRootfsHealth(
+            rootfsDir = rootfsDir,
+            prootExecutable = assetProot
+        )
+        assertFalse("brokenSymlinksOk must be false when broken symlink exists", resultWithBrokenLink.brokenSymlinksOk)
+        assertTrue("brokenSymlinks list must contain the broken link", resultWithBrokenLink.brokenSymlinks.any { it.contains("broken_tool") })
+
+        // Remove broken symlink
+        Files.deleteIfExists(brokenLink.toPath())
+        val resultClean = PreUpgradeHealthCheck.checkRootfsHealth(
+            rootfsDir = rootfsDir,
+            prootExecutable = assetProot
+        )
+        assertTrue("brokenSymlinksOk must be true when broken link is removed", resultClean.brokenSymlinksOk)
+        assertTrue("sharedLibraryOk must be true when libc.so.6 is present", resultClean.sharedLibraryOk)
+    }
+
+    private fun writeTarHeader(fos: java.io.OutputStream, name: String, typeFlag: Char, size: Long, mode: Int, linkName: String) {
+        val header = ByteArray(512)
+        System.arraycopy(name.toByteArray(), 0, header, 0, minOf(name.length, 100))
+        val modeStr = String.format("%07o ", mode)
+        System.arraycopy(modeStr.toByteArray(), 0, header, 100, 8)
+        val sizeStr = String.format("%011o ", size)
+        System.arraycopy(sizeStr.toByteArray(), 0, header, 124, 12)
+        header[156] = typeFlag.code.toByte()
+        if (linkName.isNotBlank()) {
+            System.arraycopy(linkName.toByteArray(), 0, header, 157, minOf(linkName.length, 100))
+        }
+        for (i in 148 until 156) header[i] = ' '.code.toByte()
+        var sum = 0
+        for (b in header) sum += (b.toInt() and 0xFF)
+        val chkStr = String.format("%06o\u0000 ", sum)
+        System.arraycopy(chkStr.toByteArray(), 0, header, 148, 8)
+
+        fos.write(header)
+    }
+
+    private fun writeTarPadding(fos: java.io.OutputStream, size: Int) {
+        val pad = (512 - (size % 512)) % 512
+        if (pad > 0) fos.write(ByteArray(pad))
     }
 }
