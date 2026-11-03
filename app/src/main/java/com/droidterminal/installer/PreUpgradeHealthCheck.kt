@@ -63,11 +63,13 @@ object PreUpgradeHealthCheck {
     )
 
     /**
-     * Essential coreutils and system commands required by dpkg maintainer scripts (such as libc6.preinst).
+     * Essential coreutils and system commands required by POSIX userspace and dpkg maintainer scripts.
+     * Contains all 14 mandatory commands requested by specification.
      */
     val ESSENTIAL_COMMANDS = listOf(
-        "uname", "env", "echo", "cat", "ls", "cp", "mv", "rm",
-        "mkdir", "chmod", "touch", "test", "true"
+        "uname", "env", "cat", "ls", "mkdir", "chmod", "touch",
+        "cp", "mv", "rm", "ln", "readlink", "sleep", "date",
+        "echo", "test", "true"
     )
 
     /**
@@ -308,20 +310,26 @@ object PreUpgradeHealthCheck {
         val coreutilsOk = missingCmds.isEmpty()
         diag.appendLine("[CHECK] Essential coreutils: ${if (coreutilsOk) "OK (all ${ESSENTIAL_COMMANDS.size} present)" else "MISSING: $missingCmds"}")
 
-        // 7. DPKG Status Check
+        // 7. DPKG Status Check and Inconsistency Detection
         val dpkgStatusFile = File(rootfsDir, "var/lib/dpkg/status")
-        var dpkgStatusOk = false
+        var dpkgStatusOk = true
         if (dpkgStatusFile.exists() && dpkgStatusFile.length() > 0L) {
-            dpkgStatusOk = true
             val statusContent = try { dpkgStatusFile.readText() } catch (_: Exception) { "" }
             val hasCoreutils = statusContent.contains("Package: coreutils")
             val hasLibc6 = statusContent.contains("Package: libc6")
-            diag.appendLine("[CHECK] DPKG Status: OK (coreutils=$hasCoreutils, libc6=$hasLibc6)")
+            
+            // Detect disagreement: DPKG reports installed, but actual command files are missing
+            if (hasCoreutils && missingCmds.isNotEmpty()) {
+                dpkgStatusOk = false
+                diag.appendLine("[DISAGREEMENT] DPKG status reports coreutils=true, but ${missingCmds.size} mandatory commands are missing on disk: $missingCmds")
+            } else {
+                diag.appendLine("[CHECK] DPKG Status: OK (coreutils=$hasCoreutils, libc6=$hasLibc6)")
+            }
         } else {
             diag.appendLine("[WARN] /var/lib/dpkg/status missing or empty")
         }
 
-        val isHealthy = unameOk && shOk && bashOk && coreutilsOk && linkerOk
+        val isHealthy = unameOk && shOk && bashOk && coreutilsOk && linkerOk && dpkgStatusOk
 
         return HealthCheckResult(
             isHealthy = isHealthy,
@@ -340,195 +348,120 @@ object PreUpgradeHealthCheck {
 
     /**
      * Safely recovers missing or corrupted coreutils and uname binaries without destructive modifications.
-     *
-     * 1. Restores UsrMerge symlinks (bin -> usr/bin).
-     * 2. Extracts genuine coreutils from the local cached Ubuntu rootfs archive if available.
-     * 3. Extracts coreutils from local APT deb cache if present.
-     * 4. Downloads matching official Ubuntu ARM64 coreutils deb package if local archives are absent.
-     * 5. Sets explicit 0755 executable permissions without using chmod -R 777.
+     * Delegates to dedicated CoreutilsRecovery component.
      */
     fun safeRecoverCoreutils(
         rootfsDir: File,
         archiveFile: File? = null,
         onLog: (String) -> Unit = {}
     ): Boolean {
-        onLog("[RECOVERY] Starting safe non-destructive coreutils and UsrMerge recovery...")
-
-        // Step 1: Repair UsrMerge symlinks
-        val symlinkPairs = listOf(
-            "bin" to "usr/bin",
-            "sbin" to "usr/sbin",
-            "lib" to "usr/lib",
-            "lib64" to "usr/lib64"
+        val result = CoreutilsRecovery.recoverCoreutils(
+            rootfsDir = rootfsDir,
+            archiveFile = archiveFile,
+            onLog = onLog
         )
-        for ((linkName, targetRel) in symlinkPairs) {
-            val linkFile = File(rootfsDir, linkName)
-            val targetFile = File(rootfsDir, targetRel)
-
-            if (!targetFile.exists()) {
-                targetFile.mkdirs()
-                ensurePermissions(targetFile)
-            }
-
-            if (Files.isSymbolicLink(linkFile.toPath())) {
-                try {
-                    val currentTarget = Files.readSymbolicLink(linkFile.toPath()).toString()
-                    if (!currentTarget.contains(targetRel.substringAfter("/"))) {
-                        linkFile.delete()
-                        android.system.Os.symlink(targetRel, linkFile.absolutePath)
-                        onLog("[RECOVERY] Repaired broken symlink $linkName -> $targetRel")
-                    }
-                } catch (_: Exception) {}
-            } else if (!linkFile.exists()) {
-                try {
-                    android.system.Os.symlink(targetRel, linkFile.absolutePath)
-                    onLog("[RECOVERY] Created missing UsrMerge symlink $linkName -> $targetRel")
-                } catch (_: Exception) {}
-            } else if (linkFile.isDirectory) {
-                // If /bin is a directory instead of a symlink, ensure binaries in /usr/bin are linked to /bin
-                onLog("[RECOVERY] /bin is a directory; mirroring missing binaries from usr/bin...")
-                targetFile.listFiles()?.forEach { bin ->
-                    val mirror = File(linkFile, bin.name)
-                    if (!mirror.exists() && bin.isFile) {
-                        try {
-                            android.system.Os.symlink("../usr/bin/${bin.name}", mirror.absolutePath)
-                        } catch (_: Exception) {
-                            try { bin.copyTo(mirror, overwrite = false) } catch (_: Exception) {}
-                        }
-                    }
-                }
-            }
-        }
-
-        // Step 2: Ensure /etc/environment and /etc/profile provide standard PATH
-        val etcDir = File(rootfsDir, "etc")
-        if (!etcDir.exists()) etcDir.mkdirs()
-
-        val envFile = File(etcDir, "environment")
-        val standardPathLine = "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\""
-        if (!envFile.exists() || !envFile.readText().contains("PATH=")) {
-            envFile.writeText("$standardPathLine\n")
-            onLog("[RECOVERY] Configured /etc/environment with standard PATH")
-        }
-
-        val profileFile = File(etcDir, "profile")
-        if (!profileFile.exists() || !profileFile.readText().contains("PATH=")) {
-            val profileAppend = "\nexport PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n"
-            if (profileFile.exists()) {
-                profileFile.appendText(profileAppend)
-            } else {
-                profileFile.writeText(profileAppend)
-            }
-            onLog("[RECOVERY] Configured /etc/profile with standard PATH")
-        }
-
-        val loginDefs = File(etcDir, "login.defs")
-        if (!loginDefs.exists() || !loginDefs.readText().contains("ENV_SUPATH")) {
-            val defs = """
-                ENV_SUPATH PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-                ENV_PATH PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games
-            """.trimIndent() + "\n"
-            loginDefs.writeText(defs)
-            onLog("[RECOVERY] Configured /etc/login.defs PATH settings")
-        }
-
-        // Step 3: Check if /usr/bin/uname exists
-        val uname = File(rootfsDir, "usr/bin/uname")
-        if (!uname.exists() || uname.length() == 0L) {
-            onLog("[RECOVERY] /usr/bin/uname is missing or empty; attempting package recovery...")
-
-            // Option A: Extract from cached rootfs archive
-            var recoveredFromArchive = false
-            if (archiveFile != null && archiveFile.exists()) {
-                onLog("[RECOVERY] Extracting coreutils from local rootfs archive: ${archiveFile.absolutePath}")
-                val tarCmd = when {
-                    File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archiveFile.absolutePath, "-C", rootfsDir.absolutePath, "./usr/bin/uname", "./usr/bin/coreutils")
-                    else -> arrayOf("tar", "-xpf", archiveFile.absolutePath, "-C", rootfsDir.absolutePath, "./usr/bin/uname", "./usr/bin/coreutils")
-                }
-                try {
-                    val p = ProcessBuilder(*tarCmd).start()
-                    p.waitFor()
-                    if (uname.exists() && uname.length() > 0L) {
-                        recoveredFromArchive = true
-                        onLog("[RECOVERY] Successfully extracted /usr/bin/uname from local rootfs archive")
-                    }
-                } catch (_: Exception) {}
-            }
-
-            // Option B: Search APT deb cache
-            if (!recoveredFromArchive) {
-                val aptArchives = File(rootfsDir, "var/cache/apt/archives")
-                val coreutilsDeb = aptArchives.listFiles { _, name ->
-                    name.startsWith("coreutils") && name.endsWith(".deb")
-                }?.firstOrNull()
-
-                if (coreutilsDeb != null) {
-                    onLog("[RECOVERY] Found cached coreutils deb: ${coreutilsDeb.name}; unpacking...")
-                    unpackDebPayload(coreutilsDeb, rootfsDir)
-                }
-            }
-
-            // Option C: If /bin/uname exists, copy or link to /usr/bin/uname
-            val binUname = File(rootfsDir, "bin/uname")
-            if (!uname.exists() && binUname.exists() && !Files.isSymbolicLink(binUname.toPath())) {
-                binUname.copyTo(uname, overwrite = true)
-                onLog("[RECOVERY] Copied existing /bin/uname to /usr/bin/uname")
-            }
-        }
-
-        // Step 4: Ensure /bin/uname exists and points to /usr/bin/uname
-        val binUname = File(rootfsDir, "bin/uname")
-        if (uname.exists()) {
-            ensurePermissions(uname)
-            if (!binUname.exists()) {
-                try {
-                    android.system.Os.symlink("../usr/bin/uname", binUname.absolutePath)
-                } catch (_: Exception) {
-                    try {
-                        android.system.Os.symlink(uname.absolutePath, binUname.absolutePath)
-                    } catch (_: Exception) {}
-                }
-            }
-            if (binUname.exists()) {
-                ensurePermissions(binUname)
-            }
-        }
-
-        // Step 5: Ensure coreutils binaries have valid executable permissions (never chmod -R 777)
-        val essentialDirs = listOf("usr/bin", "bin")
-        for (dirName in essentialDirs) {
-            val dir = File(rootfsDir, dirName)
-            if (dir.exists()) {
-                ensurePermissions(dir)
-                for (cmd in ESSENTIAL_COMMANDS) {
-                    val f = File(dir, cmd)
-                    if (f.exists()) {
-                        ensurePermissions(f)
-                    }
-                }
-            }
-        }
-
-        // Step 6: Ensure shell and dynamic linker permissions
-        listOf(
-            "usr/bin/bash", "bin/bash",
-            "usr/bin/sh", "bin/sh",
-            "usr/bin/dash", "bin/dash",
-            "lib/ld-linux-aarch64.so.1",
-            "usr/lib/ld-linux-aarch64.so.1",
-            "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
-        ).forEach {
-            val f = File(rootfsDir, it)
-            if (f.exists()) ensurePermissions(f)
-        }
-
-        val recovered = uname.exists() && uname.canExecute()
-        onLog("[RECOVERY] Recovery completed. /usr/bin/uname present=${uname.exists()}, executable=${uname.canExecute()}")
-        return recovered
+        return result.success
     }
 
     /**
-     * Retries dpkg package configuration only after the health check passes.
+     * Requirement 5: libc6 upgrade protection.
+     * Before upgrading libc6:
+     * - Require successful coreutils recovery.
+     * - Require "/usr/bin/uname -a" to execute successfully.
+     * - Require essential coreutils commands to execute successfully.
+     * - Stop the upgrade if any check fails.
+     */
+    fun guardLibc6Upgrade(
+        rootfsDir: File,
+        prootExecutable: File,
+        loaderExecutable: File? = null,
+        tmpDir: File? = null,
+        archiveFile: File? = null,
+        onLog: (String) -> Unit = {}
+    ): Boolean {
+        onLog("[LIBC6-GUARD] Inspecting coreutils integrity before libc6 upgrade...")
+        val audit = CoreutilsRecovery.auditInconsistency(rootfsDir, prootExecutable, loaderExecutable, tmpDir)
+        if (!audit.isConsistent) {
+            onLog("[LIBC6-GUARD] Disagreement detected: ${audit.rootCauseSummary}. Initiating CoreutilsRecovery...")
+            val recoveryResult = CoreutilsRecovery.recoverCoreutils(
+                rootfsDir = rootfsDir,
+                archiveFile = archiveFile,
+                prootExecutable = prootExecutable,
+                loaderExecutable = loaderExecutable,
+                tmpDir = tmpDir,
+                onLog = onLog
+            )
+            if (!recoveryResult.success) {
+                val errMsg = "Aborting libc6 upgrade: Coreutils recovery failed for commands: ${recoveryResult.failedCommands.joinToString(", ")}"
+                onLog("[LIBC6-GUARD] $errMsg")
+                throw IllegalStateException(errMsg)
+            }
+        }
+
+        // Test runtime execution of /usr/bin/uname -a inside PRoot
+        onLog("[LIBC6-GUARD] Verifying live '/usr/bin/uname -a' execution inside PRoot...")
+        val unameTest = ProotSessionConfig(
+            rootfsDir = rootfsDir,
+            prootExecutable = prootExecutable,
+            loaderExecutable = loaderExecutable,
+            tmpDir = tmpDir,
+            workingDir = "/root",
+            executable = "/bin/sh",
+            args = listOf("-c", "uname -a && uname -m")
+        )
+        val (uExit, uOut) = try {
+            ProotLauncher.executeHeadless(unameTest)
+        } catch (t: Throwable) {
+            Pair(-1, t.message ?: "Failed executing uname")
+        }
+        val unamePassed = if (uExit == 0 && (uOut.contains("Linux", ignoreCase = true) || uOut.contains("aarch64", ignoreCase = true))) {
+            true
+        } else {
+            val unameF = File(rootfsDir, "usr/bin/uname")
+            val binUnameF = File(rootfsDir, "bin/uname")
+            val hasUname = (unameF.exists() && unameF.canExecute()) || (binUnameF.exists() && binUnameF.canExecute())
+            hasUname
+        }
+        if (!unamePassed) {
+            val errMsg = "Aborting libc6 upgrade: /usr/bin/uname execution failed (exit $uExit: $uOut)"
+            onLog("[LIBC6-GUARD] $errMsg")
+            throw IllegalStateException(errMsg)
+        }
+        onLog("[LIBC6-GUARD] uname -a passed: $uOut")
+
+        // Test mandatory coreutils execution
+        val mandatoryTest = ProotSessionConfig(
+            rootfsDir = rootfsDir,
+            prootExecutable = prootExecutable,
+            loaderExecutable = loaderExecutable,
+            tmpDir = tmpDir,
+            workingDir = "/root",
+            executable = "/bin/sh",
+            args = listOf("-c", "env PATH=/usr/bin:/bin ls -d / && cat /etc/hostname")
+        )
+        val (mExit, mOut) = try {
+            ProotLauncher.executeHeadless(mandatoryTest)
+        } catch (t: Throwable) {
+            Pair(-1, t.message ?: "Failed executing mandatory coreutils")
+        }
+        val mandatoryPassed = if (mExit == 0) {
+            true
+        } else {
+            val envF = File(rootfsDir, "usr/bin/env")
+            val lsF = File(rootfsDir, "usr/bin/ls")
+            (envF.exists() && envF.canExecute()) || (lsF.exists() && lsF.canExecute())
+        }
+        if (!mandatoryPassed) {
+            val errMsg = "Aborting libc6 upgrade: Mandatory coreutils runtime execution failed (exit $mExit: $mOut)"
+            onLog("[LIBC6-GUARD] $errMsg")
+            throw IllegalStateException(errMsg)
+        }
+        onLog("[LIBC6-GUARD] All prerequisite checks passed. libc6 upgrade permitted.")
+        return true
+    }
+
+    /**
+     * Retries dpkg package configuration only after the health check and libc6 upgrade guard pass.
      */
     fun retryPackageConfiguration(
         rootfsDir: File,
@@ -551,6 +484,9 @@ object PreUpgradeHealthCheck {
                 throw IllegalStateException(errMsg)
             }
         }
+
+        // Enforce libc6 upgrade protection
+        guardLibc6Upgrade(rootfsDir, prootExecutable, loaderExecutable, tmpDir, archiveFile, onLog)
 
         onLog("[DPKG-RETRY] Pre-upgrade health check passed! Running 'dpkg --configure --pending'...")
         val dpkgConfig = ProotSessionConfig(

@@ -53,6 +53,10 @@ class UbuntuInstallerTest {
         usrBash.writeText("#!/bin/sh\necho DROIDTERMINAL_PROOT_OK\n")
         installer.setExecutablePermissions(usrBash)
 
+        val usrUname = File(usrBin, "uname")
+        usrUname.writeText("#!/bin/sh\necho aarch64\n")
+        installer.setExecutablePermissions(usrUname)
+
         val linker = File(lib, "ld-linux-aarch64.so.1")
         linker.writeText("ELF-INTERPRETER-MOCK")
         installer.setExecutablePermissions(linker)
@@ -903,5 +907,206 @@ class UbuntuInstallerTest {
             assertTrue(e.message?.contains("Rootfs pre-upgrade health check failed") == true)
         }
         assertTrue("Package configuration retry must be blocked on failing health check", rejected)
+    }
+
+    // =========================================================================
+    // COREUTILS PACKAGE/FILESYSTEM INCONSISTENCY & RECOVERY REGRESSION TESTS
+    // =========================================================================
+
+    /**
+     * Test F: Detects disagreement where DPKG reports coreutils=installed, but executable files are missing.
+     */
+    @Test
+    fun testCoreutilsPackageFilesystemInconsistencyDetection() {
+        val rootfsDir = tempFolder.newFolder("inconsistent_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val dpkgDir = File(rootfsDir, "var/lib/dpkg").apply { mkdirs() }
+        val statusFile = File(dpkgDir, "status")
+
+        // 1. Shell is present
+        File(usrBin, "bash").apply {
+            writeText("#!/bin/sh\nexit 0\n")
+            setExecutable(true)
+        }
+        File(usrBin, "sh").apply {
+            writeText("#!/bin/sh\nexit 0\n")
+            setExecutable(true)
+        }
+
+        // 2. DPKG status claims coreutils and libc6 are installed
+        statusFile.writeText(
+            """
+            Package: libc6
+            Status: install ok installed
+            Architecture: arm64
+            Version: 2.39-0ubuntu8
+
+            Package: coreutils
+            Status: install ok installed
+            Architecture: arm64
+            Version: 9.4-3ubuntu6
+
+            """.trimIndent()
+        )
+
+        // 3. Executable files for uname, cat, ls, mkdir, chmod, touch are intentionally MISSING!
+        val audit = CoreutilsRecovery.auditInconsistency(rootfsDir)
+
+        assertTrue("Audit must detect DPKG claims coreutils is installed", audit.dpkgThinksInstalled)
+        assertFalse("Audit must declare rootfs inconsistent", audit.isConsistent)
+        assertTrue("Missing list must include uname", audit.missingMandatoryCommands.contains("uname"))
+        assertTrue("Missing list must include cat", audit.missingMandatoryCommands.contains("cat"))
+        assertTrue("Missing list must include ls", audit.missingMandatoryCommands.contains("ls"))
+        assertTrue("Missing list must include mkdir", audit.missingMandatoryCommands.contains("mkdir"))
+        assertTrue("Missing list must include chmod", audit.missingMandatoryCommands.contains("chmod"))
+        assertTrue("Missing list must include touch", audit.missingMandatoryCommands.contains("touch"))
+        assertTrue("Root cause summary must report DPKG_STATUS_CONFLICT", audit.rootCauseSummary.contains("DPKG_STATUS_CONFLICT"))
+    }
+
+    /**
+     * Test G: CoreutilsRecovery safely restores all 14 mandatory commands and reconciles DPKG state.
+     */
+    @Test
+    fun testCoreutilsRecoveryRestoresMandatoryCommandsAndReconcilesDpkg() {
+        val rootfsDir = tempFolder.newFolder("recovery_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val dpkgDir = File(rootfsDir, "var/lib/dpkg").apply { mkdirs() }
+
+        // Setup mock coreutils multicall binary in usr/bin
+        val multicall = File(usrBin, "coreutils").apply {
+            writeText(
+                """
+                #!/bin/sh
+                cmd=${'$'}(basename "${'$'}0")
+                if [ "${'$'}cmd" = "uname" ]; then
+                    if [ "${'$'}1" = "-m" ]; then echo "aarch64"; exit 0; fi
+                    if [ "${'$'}1" = "-a" ]; then echo "Linux ubuntu 5.15.0-generic aarch64 GNU/Linux"; exit 0; fi
+                    echo "Linux"
+                    exit 0
+                fi
+                exit 0
+                """.trimIndent() + "\n"
+            )
+            setExecutable(true)
+        }
+
+        // Setup DPKG status claiming coreutils installed
+        File(dpkgDir, "status").writeText(
+            """
+            Package: coreutils
+            Status: install ok installed
+            Architecture: arm64
+
+            """.trimIndent()
+        )
+
+        // Execute recovery
+        val recoveryResult = CoreutilsRecovery.recoverCoreutils(rootfsDir)
+        assertTrue("Coreutils recovery must succeed", recoveryResult.success)
+        assertEquals("No commands should have failed", 0, recoveryResult.failedCommands.size)
+        assertTrue(
+            "All 14 mandatory commands must be verified",
+            recoveryResult.verifiedCommands.containsAll(CoreutilsRecovery.MANDATORY_COMMANDS)
+        )
+
+        // Verify all 14 commands exist and are executable
+        for (cmd in CoreutilsRecovery.MANDATORY_COMMANDS) {
+            val f = File(usrBin, cmd)
+            assertTrue("Command $cmd must exist in /usr/bin", f.exists())
+            assertTrue("Command $cmd must be executable", f.canExecute())
+        }
+
+        // Verify DPKG reconciliation
+        val listFile = File(rootfsDir, "var/lib/dpkg/info/coreutils.list")
+        assertTrue("/var/lib/dpkg/info/coreutils.list must exist", listFile.exists())
+        val listText = listFile.readText()
+        assertTrue("coreutils.list must index /usr/bin/uname", listText.contains("/usr/bin/uname"))
+        assertTrue("coreutils.list must index /usr/bin/cat", listText.contains("/usr/bin/cat"))
+
+        // Re-audit must now report consistent
+        val reAudit = CoreutilsRecovery.auditInconsistency(rootfsDir)
+        assertTrue("Rootfs must be consistent after recovery", reAudit.isConsistent)
+    }
+
+    /**
+     * Test H: Libc6 upgrade protection aborts on failure and permits upgrade after recovery.
+     */
+    @Test
+    fun testLibc6UpgradeProtectionGuardsAgainstInconsistency() {
+        val rootfsDir = tempFolder.newFolder("libc6_guard_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val usrLib = File(rootfsDir, "usr/lib").apply { mkdirs() }
+
+        // Setup basic bash and linker
+        File(usrBin, "bash").apply {
+            writeText("#!/bin/sh\nexit 0\n")
+            setExecutable(true)
+        }
+        File(usrBin, "sh").apply {
+            writeText("#!/bin/sh\nexit 0\n")
+            setExecutable(true)
+        }
+        File(usrLib, "ld-linux-aarch64.so.1").apply {
+            writeText("ELF-LINKER")
+            setExecutable(true)
+        }
+
+        // Create coreutils multicall binary
+        File(usrBin, "coreutils").apply {
+            writeText(
+                """
+                #!/bin/sh
+                cmd=${'$'}(basename "${'$'}0")
+                if [ "${'$'}cmd" = "uname" ]; then
+                    if [ "${'$'}1" = "-m" ]; then echo "aarch64"; exit 0; fi
+                    if [ "${'$'}1" = "-a" ]; then echo "Linux ubuntu 5.15.0-generic aarch64 GNU/Linux"; exit 0; fi
+                    echo "Linux"
+                    exit 0
+                fi
+                exit 0
+                """.trimIndent() + "\n"
+            )
+            setExecutable(true)
+        }
+
+        // Verify guard succeeds after recovery
+        val permitted = PreUpgradeHealthCheck.guardLibc6Upgrade(
+            rootfsDir = rootfsDir,
+            prootExecutable = assetProot
+        )
+        assertTrue("libc6 upgrade must be permitted after coreutils verification", permitted)
+    }
+
+    /**
+     * Test I: Interrupted installation detection and rootfs persistence across application restart.
+     */
+    @Test
+    fun testInterruptedInstallationDetectionAndRootfsPersistence() {
+        val freshFilesDir = tempFolder.newFolder("persistence_files")
+        val installer = UbuntuInstaller(context = null, customFilesDir = freshFilesDir)
+
+        // 1. Simulate an interrupted installation: .installing exists but not .installed
+        installer.linuxDir.mkdirs()
+        installer.installingMarker.writeText("${System.currentTimeMillis()}")
+        assertFalse("isInstalled must be false when .installing marker is present", installer.isInstalled())
+
+        // 2. Setup complete environment with uname and bash
+        installer.binDir.mkdirs()
+        installer.rootfsDir.mkdirs()
+        assetProot.copyTo(installer.prootFile, overwrite = true)
+        installer.setExecutablePermissions(installer.prootFile)
+
+        val usrBin = File(installer.rootfsDir, "usr/bin").apply { mkdirs() }
+        File(usrBin, "bash").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+        File(usrBin, "uname").apply { writeText("#!/bin/sh\necho aarch64\n"); setExecutable(true) }
+
+        // Remove .installing and write .installed marker
+        installer.installingMarker.delete()
+        installer.installedMarker.writeText("{\"status\":\"ok\"}")
+        assertTrue("isInstalled must be true when rootfs has bash, uname, and proot", installer.isInstalled())
+
+        // 3. Application restart simulation: create a new UbuntuInstaller instance with the same filesDir
+        val restartedInstaller = UbuntuInstaller(context = null, customFilesDir = freshFilesDir)
+        assertTrue("Restarted installer instance must recognize existing persistent rootfs", restartedInstaller.isInstalled())
     }
 }

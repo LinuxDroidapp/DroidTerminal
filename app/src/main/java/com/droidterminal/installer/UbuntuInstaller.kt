@@ -69,6 +69,7 @@ class UbuntuInstaller(
     val shmDir: File = File(linuxDir, "shm")
     val downloadsDir: File = File(linuxDir, "downloads")
     val installedMarker: File = File(linuxDir, ".installed")
+    val installingMarker: File = File(linuxDir, ".installing")
     val lockFile: File = File(linuxDir, ".installlock")
     val manifestFile: File = File(linuxDir, "manifest.json")
     val prootFile: File = File(binDir, "proot")
@@ -104,11 +105,15 @@ class UbuntuInstaller(
      * Checks if the Linux environment is already completely installed and healthy.
      */
     fun isInstalled(): Boolean {
+        if (installingMarker.exists()) return false
         if (!installedMarker.exists()) return false
         if (!rootfsDir.exists() || !rootfsDir.isDirectory) return false
         val bashFile = File(rootfsDir, "bin/bash")
         val usrBashFile = File(rootfsDir, "usr/bin/bash")
         if (!bashFile.exists() && !usrBashFile.exists()) return false
+        val unameFile = File(rootfsDir, "usr/bin/uname")
+        val binUname = File(rootfsDir, "bin/uname")
+        if (!unameFile.exists() && !binUname.exists()) return false
         if (!prootFile.exists() || !prootFile.canExecute()) return false
         return true
     }
@@ -295,6 +300,8 @@ class UbuntuInstaller(
         installJob = scope.launch {
             try {
                 acquireLock()
+                installingMarker.parentFile?.mkdirs()
+                installingMarker.writeText("${System.currentTimeMillis()}")
 
                 // Stage 1: Check device & CPU architecture
                 updateState(InstallStage.CHECKING_DEVICE, "Verifying ARM64 CPU and Android compatibility...", -1f)
@@ -343,6 +350,12 @@ class UbuntuInstaller(
                 // Atomic promotion: promote staging to active rootfs
                 promoteStagingToRootfs()
 
+                // Post-promotion Coreutils integrity audit & safe recovery
+                val postPromoAudit = CoreutilsRecovery.auditInconsistency(rootfsDir)
+                if (!postPromoAudit.isConsistent) {
+                    CoreutilsRecovery.recoverCoreutils(rootfsDir, archiveFile)
+                }
+
                 // Stage 6: Prepare PRoot runtime
                 updateState(InstallStage.PREPARING_PROOT, "Preparing ARM64 PRoot executable and companion loader...", -1f)
                 installProotBinaries()
@@ -362,6 +375,7 @@ class UbuntuInstaller(
                 // Stage 10: Complete and persist manifest
                 writeEnvironmentManifest()
                 writeCompletionMarker()
+                if (installingMarker.exists()) installingMarker.delete()
 
                 updateState(InstallStage.READY, "Ubuntu Linux environment is ready!", 1f)
                 _state.value = _state.value.copy(isComplete = true)
@@ -427,7 +441,10 @@ class UbuntuInstaller(
             if (exitCode != 0) {
                 copyPreservingSymlinks(stagingDir, rootfsDir)
             }
-            stagingDir.deleteRecursively()
+            val hasBash = File(rootfsDir, "bin/bash").exists() || File(rootfsDir, "usr/bin/bash").exists()
+            if (hasBash) {
+                stagingDir.deleteRecursively()
+            }
         }
     }
 
@@ -435,21 +452,26 @@ class UbuntuInstaller(
         if (!dest.exists()) dest.mkdirs()
         source.listFiles()?.forEach { file ->
             val target = File(dest, file.name)
+            val targetPath = target.toPath()
             if (Files.isSymbolicLink(file.toPath())) {
                 try {
                     val linkTarget = Files.readSymbolicLink(file.toPath())
-                    if (target.exists()) target.delete()
-                    Files.createSymbolicLink(target.toPath(), linkTarget)
+                    if (Files.isSymbolicLink(targetPath) || Files.exists(targetPath)) {
+                        Files.deleteIfExists(targetPath)
+                    }
+                    Files.createSymbolicLink(targetPath, linkTarget)
                 } catch (e: Exception) {
-                    file.copyTo(target, overwrite = true)
+                    try { file.copyTo(target, overwrite = true) } catch (_: Exception) {}
                 }
             } else if (file.isDirectory) {
                 copyPreservingSymlinks(file, target)
             } else {
-                file.copyTo(target, overwrite = true)
-                if (file.canExecute()) {
-                    setExecutablePermissions(target)
-                }
+                try {
+                    file.copyTo(target, overwrite = true)
+                    if (file.canExecute()) {
+                        setExecutablePermissions(target)
+                    }
+                } catch (_: Exception) {}
             }
         }
     }
@@ -573,6 +595,7 @@ class UbuntuInstaller(
 
     /**
      * Extracts rootfs tarball using toybox tar with fallback to system tar, preserving symlinks.
+     * Excludes static ./dev device nodes which cannot be created in unprivileged Android apps.
      */
     private fun extractArchive(archive: File, targetDir: File) {
         if (!targetDir.exists()) targetDir.mkdirs()
@@ -580,10 +603,11 @@ class UbuntuInstaller(
             throw IOException("Extraction target directory does not exist or is not a directory: ${targetDir.absolutePath}")
         }
 
+        val devExcludes = arrayOf("--exclude=./dev/*", "--exclude=dev/*", "--exclude=./dev", "--exclude=dev")
         val tarCmd = when {
-            File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath)
-            File("/system/bin/tar").exists() -> arrayOf("/system/bin/tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath)
-            else -> arrayOf("tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath)
+            File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
+            File("/system/bin/tar").exists() -> arrayOf("/system/bin/tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
+            else -> arrayOf("tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
         }
 
         val process = ProcessBuilder(*tarCmd)
@@ -595,12 +619,20 @@ class UbuntuInstaller(
             // Drain output
         }
         val exitCode = process.waitFor()
-        if (exitCode != 0) {
-            val bash = File(targetDir, "bin/bash")
-            val usrBash = File(targetDir, "usr/bin/bash")
-            if (!bash.exists() && !usrBash.exists()) {
-                throw IllegalStateException("Tar extraction returned code $exitCode and /bin/bash is missing.")
-            }
+
+        // Post-extraction verification: ensure shell and essential coreutils exist
+        val bash = File(targetDir, "bin/bash")
+        val usrBash = File(targetDir, "usr/bin/bash")
+        if (!bash.exists() && !usrBash.exists()) {
+            throw IllegalStateException("Tar extraction failed (exit code $exitCode): /bin/bash is missing from extracted rootfs.")
+        }
+
+        // Post-extraction check for coreutils commands (uname, cat, ls, etc.)
+        val usrUname = File(targetDir, "usr/bin/uname")
+        val binUname = File(targetDir, "bin/uname")
+        if (!usrUname.exists() && !binUname.exists()) {
+            // Recover missing coreutils from archive directly
+            CoreutilsRecovery.extractCoreutilsFromTarArchive(archive, targetDir) {}
         }
     }
 
@@ -1228,6 +1260,33 @@ class UbuntuInstaller(
         val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
         val loader = activeLoaderFile ?: assetsManager.resolveLoader()
         return PreUpgradeHealthCheck.retryPackageConfiguration(rootfsDir, proot, loader, tmpDir, archiveFile)
+    }
+
+    /**
+     * Audits rootfs for Coreutils package vs filesystem inconsistency.
+     */
+    fun auditCoreutilsIntegrity(): CoreutilsAuditResult {
+        val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
+        val loader = activeLoaderFile ?: assetsManager.resolveLoader()
+        return CoreutilsRecovery.auditInconsistency(rootfsDir, proot, loader, tmpDir)
+    }
+
+    /**
+     * Executes safe, non-destructive Coreutils recovery.
+     */
+    fun recoverCoreutils(archiveFile: File? = null): CoreutilsRecoveryResult {
+        val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
+        val loader = activeLoaderFile ?: assetsManager.resolveLoader()
+        return CoreutilsRecovery.recoverCoreutils(rootfsDir, archiveFile, proot, loader, tmpDir)
+    }
+
+    /**
+     * Protects libc6 upgrade: verifies coreutils and uname before allowing upgrade.
+     */
+    fun guardLibc6Upgrade(archiveFile: File? = null): Boolean {
+        val proot = if (activeProotFile.exists() && activeProotFile.canExecute()) activeProotFile else assetsManager.resolveProot()
+        val loader = activeLoaderFile ?: assetsManager.resolveLoader()
+        return PreUpgradeHealthCheck.guardLibc6Upgrade(rootfsDir, proot, loader, tmpDir, archiveFile)
     }
 
     private fun writeEnvironmentManifest() {
