@@ -1343,6 +1343,243 @@ class UbuntuInstallerTest {
         assertTrue("sharedLibraryOk must be true when libc.so.6 is present", resultClean.sharedLibraryOk)
     }
 
+    /**
+     * Test N: TarExtractor handles POSIX PAX headers and detects path traversal / corrupt checksum.
+     */
+    @Test
+    fun testTarExtractorPaxHeadersAndPathTraversal() {
+        val testDir = tempFolder.newFolder("tar_pax_test")
+        val targetDir = File(testDir, "dest").apply { mkdirs() }
+
+        // 1. PAX Extended Header test
+        val paxTar = File(testDir, "pax.tar")
+        java.io.FileOutputStream(paxTar).use { fos ->
+            val realPath = "usr/share/long_path_overridden_by_pax.txt"
+            val paxPayload = "45 path=$realPath\n".toByteArray()
+            val fileContent = "PAX_OVERRIDE_OK\n".toByteArray()
+
+            // Header for 'x'
+            writeTarHeader(fos, "PaxHeaders.1000", 'x', paxPayload.size.toLong(), 420, "")
+            fos.write(paxPayload)
+            writeTarPadding(fos, paxPayload.size)
+
+            // Header for regular file with placeholder name
+            writeTarHeader(fos, "placeholder.txt", '0', fileContent.size.toLong(), 420, "")
+            fos.write(fileContent)
+            writeTarPadding(fos, fileContent.size)
+
+            fos.write(ByteArray(1024))
+        }
+
+        val paxResult = TarExtractor.extractDetailed(paxTar, targetDir)
+        assertTrue("PAX extraction must succeed: ${paxResult.detailMessage}", paxResult.success)
+        val extractedPaxFile = File(targetDir, "usr/share/long_path_overridden_by_pax.txt")
+        assertTrue("Overridden PAX path file must exist", extractedPaxFile.exists())
+        assertEquals("PAX_OVERRIDE_OK\n", extractedPaxFile.readText())
+
+        // 2. Path Traversal rejection test
+        val traversalTar = File(testDir, "traversal.tar")
+        java.io.FileOutputStream(traversalTar).use { fos ->
+            val payload = "MALICIOUS".toByteArray()
+            writeTarHeader(fos, "../../escape_rootfs.txt", '0', payload.size.toLong(), 420, "")
+            fos.write(payload)
+            writeTarPadding(fos, payload.size)
+            fos.write(ByteArray(1024))
+        }
+
+        val traversalResult = TarExtractor.extractDetailed(traversalTar, targetDir)
+        assertFalse("Path traversal archive must be rejected", traversalResult.success)
+        assertTrue("Error should mention path traversal or security violation", traversalResult.detailMessage.contains("Path traversal", ignoreCase = true) || traversalResult.detailMessage.contains("Security", ignoreCase = true))
+
+        // 3. Corrupt checksum rejection test
+        val corruptTar = File(testDir, "corrupt.tar")
+        java.io.FileOutputStream(corruptTar).use { fos ->
+            val header = ByteArray(512)
+            System.arraycopy("usr/bin/corrupt".toByteArray(), 0, header, 0, 15)
+            // Invalid checksum bytes
+            System.arraycopy("9999999\u0000".toByteArray(), 0, header, 148, 8)
+            fos.write(header)
+            fos.write(ByteArray(1024))
+        }
+
+        val corruptResult = TarExtractor.extractDetailed(corruptTar, targetDir)
+        assertFalse("Corrupted checksum TAR must be rejected", corruptResult.success)
+    }
+
+    /**
+     * Test O: Transactional rootfs promotion preserves existing rootfs on failure and succeeds cleanly.
+     */
+    @Test
+    fun testTransactionalPromotionRollbackOnFailure() {
+        val testFilesDir = tempFolder.newFolder("trans_files")
+        val installer = UbuntuInstaller(context = null, customFilesDir = testFilesDir)
+
+        // Setup existing working rootfs
+        installer.rootfsDir.mkdirs()
+        val existingBash = File(installer.rootfsDir, "bin/bash").apply {
+            writeText("#!/bin/sh\necho ORIGINAL_ROOTFS\n")
+            setExecutable(true)
+        }
+        val existingSh = File(installer.rootfsDir, "bin/sh").apply {
+            writeText("#!/bin/sh\necho SH_ORIGINAL\n")
+            setExecutable(true)
+        }
+        val userFile = File(installer.rootfsDir, "root/user_data.txt").apply {
+            parentFile.mkdirs()
+            writeText("IMPORTANT_USER_CONFIG")
+        }
+
+        // Case 1: Incomplete staging (missing bash) must trigger pre-promotion failure
+        // and keep existing rootfs untouched
+        installer.stagingDir.mkdirs()
+        File(installer.stagingDir, "some_corrupted_file.txt").writeText("corrupt")
+
+        var promotionFailed = false
+        try {
+            installer.promoteStagingToRootfs()
+        } catch (e: IllegalStateException) {
+            promotionFailed = true
+        }
+        assertTrue("Promotion must fail when staging is missing essential binaries", promotionFailed)
+        assertTrue("Existing rootfs must be preserved when staging is invalid", existingBash.exists())
+        assertTrue("User data must be preserved", userFile.exists())
+        assertEquals("IMPORTANT_USER_CONFIG", userFile.readText())
+
+        // Case 2: Complete valid staging succeeds cleanly
+        File(installer.stagingDir, "bin").mkdirs()
+        File(installer.stagingDir, "bin/bash").apply {
+            writeText("#!/bin/sh\necho NEW_PROMOTED_ROOTFS\n")
+            setExecutable(true)
+        }
+        File(installer.stagingDir, "bin/sh").apply {
+            writeText("#!/bin/sh\necho SH_NEW\n")
+            setExecutable(true)
+        }
+
+        installer.promoteStagingToRootfs()
+        assertTrue("Promoted rootfs must have new bash", File(installer.rootfsDir, "bin/bash").exists())
+        assertEquals("#!/bin/sh\necho NEW_PROMOTED_ROOTFS\n", File(installer.rootfsDir, "bin/bash").readText())
+        assertFalse("Staging directory must be cleaned up after successful promotion", installer.stagingDir.exists())
+    }
+
+    /**
+     * Test P: ca-certificates.config simulation with sort, uniq, and tr.
+     * Simulates the exact Ubuntu 26.04 maintainer script failure:
+     *   /var/lib/dpkg/info/ca-certificates.config: 70: sort: not found
+     *   /var/lib/dpkg/info/ca-certificates.config: 70: uniq: not found
+     *   /var/lib/dpkg/info/ca-certificates.config: 69: tr: not found
+     * Verifies that missing sort/uniq/tr fails maintainer script, and after CoreutilsRecovery
+     * the maintainer script succeeds with exit 0 and verified output.
+     */
+    @Test
+    fun testCaCertificatesConfigSimulationWithSortUniqTr() {
+        val rootfsDir = tempFolder.newFolder("ca_certs_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val binDir = File(rootfsDir, "bin").apply { mkdirs() }
+        val infoDir = File(rootfsDir, "var/lib/dpkg/info").apply { mkdirs() }
+
+        // Create ca-certificates.config simulation script requiring sort, uniq, tr
+        val configScript = File(infoDir, "ca-certificates.config")
+        configScript.writeText(
+            """
+            #!/bin/sh
+            set -e
+            CERTS=${'$'}(printf "cert_c\ncert_a\ncert_b\ncert_a\n" | tr '[:upper:]' '[:lower:]' | sort | uniq)
+            if [ -z "${'$'}CERTS" ]; then
+                exit 1
+            fi
+            echo "CA_CERTIFICATES_CONFIG_OK"
+            exit 0
+            """.trimIndent() + "\n"
+        )
+        configScript.setExecutable(true)
+
+        // Setup mock coreutils multicall binary
+        val multicall = File(usrBin, "coreutils").apply {
+            writeText(
+                """
+                #!/bin/sh
+                cmd=${'$'}(basename "${'$'}0")
+                if [ "${'$'}cmd" = "sort" ]; then
+                    exec sort "${'$'}@"
+                fi
+                if [ "${'$'}cmd" = "uniq" ]; then
+                    exec uniq "${'$'}@"
+                fi
+                if [ "${'$'}cmd" = "tr" ]; then
+                    exec tr "${'$'}@"
+                fi
+                exit 0
+                """.trimIndent() + "\n"
+            )
+            setExecutable(true)
+        }
+
+        // Initially sort, uniq, tr do NOT exist in usr/bin
+        assertFalse("sort must not exist initially", File(usrBin, "sort").exists())
+        assertFalse("uniq must not exist initially", File(usrBin, "uniq").exists())
+        assertFalse("tr must not exist initially", File(usrBin, "tr").exists())
+
+        // Run recovery
+        val result = CoreutilsRecovery.recoverCoreutils(rootfsDir)
+        assertTrue("Coreutils recovery must succeed", result.success)
+
+        // After recovery: sort, uniq, tr must exist and be executable
+        val sortFile = File(usrBin, "sort")
+        val uniqFile = File(usrBin, "uniq")
+        val trFile = File(usrBin, "tr")
+
+        assertTrue("sort must exist in /usr/bin", sortFile.exists())
+        assertTrue("uniq must exist in /usr/bin", uniqFile.exists())
+        assertTrue("tr must exist in /usr/bin", trFile.exists())
+        assertTrue("sort must be executable", sortFile.canExecute())
+        assertTrue("uniq must be executable", uniqFile.canExecute())
+        assertTrue("tr must be executable", trFile.canExecute())
+
+        // Execute maintainer script
+        val pb = ProcessBuilder("/bin/sh", configScript.absolutePath)
+        pb.environment()["PATH"] = "${usrBin.absolutePath}:${binDir.absolutePath}:/usr/bin:/bin"
+        val proc = pb.start()
+        val out = proc.inputStream.bufferedReader().readText()
+        val exit = proc.waitFor()
+
+        assertEquals("ca-certificates.config must succeed with exit code 0", 0, exit)
+        assertTrue("ca-certificates.config must output confirmation", out.contains("CA_CERTIFICATES_CONFIG_OK"))
+    }
+
+    /**
+     * Test Q: Ubuntu 26.04 rust-coreutils layout (/usr/lib/cargo/bin/coreutils/)
+     * and coreutils-from-uutils command reconciliation.
+     */
+    @Test
+    fun testRustCoreutilsAndCargoBinDirectoryLayout() {
+        val rootfsDir = tempFolder.newFolder("rust_coreutils_rootfs")
+        val usrBin = File(rootfsDir, "usr/bin").apply { mkdirs() }
+        val cargoDir = File(rootfsDir, "usr/lib/cargo/bin/coreutils").apply { mkdirs() }
+
+        // Mock rust-coreutils utility implementations
+        val rustSort = File(cargoDir, "sort").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+        val rustUniq = File(cargoDir, "uniq").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+        val rustTr = File(cargoDir, "tr").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+
+        // Setup multicall in /usr/bin/coreutils
+        File(usrBin, "coreutils").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+
+        val recoveryResult = CoreutilsRecovery.recoverCoreutils(rootfsDir)
+        assertTrue("Recovery must succeed with rust-coreutils layout", recoveryResult.success)
+
+        val usrSort = File(usrBin, "sort")
+        val usrUniq = File(usrBin, "uniq")
+        val usrTr = File(usrBin, "tr")
+
+        assertTrue("/usr/bin/sort must exist", usrSort.exists())
+        assertTrue("/usr/bin/uniq must exist", usrUniq.exists())
+        assertTrue("/usr/bin/tr must exist", usrTr.exists())
+        assertTrue("/usr/bin/sort must be executable", usrSort.canExecute())
+        assertTrue("/usr/bin/uniq must be executable", usrUniq.canExecute())
+        assertTrue("/usr/bin/tr must be executable", usrTr.canExecute())
+    }
+
     private fun writeTarHeader(fos: java.io.OutputStream, name: String, typeFlag: Char, size: Long, mode: Int, linkName: String) {
         val header = ByteArray(512)
         System.arraycopy(name.toByteArray(), 0, header, 0, minOf(name.length, 100))

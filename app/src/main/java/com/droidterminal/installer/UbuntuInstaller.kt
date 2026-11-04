@@ -416,35 +416,85 @@ class UbuntuInstaller(
     }
 
     /**
-     * Promotes staging directory to rootfs atomically while strictly preserving symlinks.
+     * Promotes staging directory to rootfs using a transactional swap strategy.
+     * 1. Verifies staging integrity before touching the active rootfs.
+     * 2. Backs up existing rootfs to a timestamped backup directory.
+     * 3. Promotes staging to rootfs.
+     * 4. Verifies promoted rootfs.
+     * 5. Removes backup only after verification passes.
+     * 6. Automatically rolls back to the previous rootfs if promotion or verification fails.
      */
     internal fun promoteStagingToRootfs() {
-        if (!stagingDir.exists() || stagingDir.list().isNullOrEmpty()) return
+        if (!stagingDir.exists() || stagingDir.list().isNullOrEmpty()) {
+            throw IllegalStateException("Cannot promote staging directory: directory is missing or empty (${stagingDir.absolutePath})")
+        }
         rootfsDir.parentFile?.let { p -> if (!p.exists()) p.mkdirs() }
 
-        if (rootfsDir.exists()) {
-            rootfsDir.deleteRecursively()
+        // Step 1: Pre-promotion integrity check of staging directory
+        val stagingBash = File(stagingDir, "bin/bash").exists() || File(stagingDir, "usr/bin/bash").exists()
+        val stagingSh = File(stagingDir, "bin/sh").exists() || File(stagingDir, "usr/bin/sh").exists()
+        if (!stagingBash || !stagingSh) {
+            throw IllegalStateException("Staging directory failed pre-promotion verification: essential shell binaries missing.")
         }
 
-        if (!stagingDir.renameTo(rootfsDir)) {
-            rootfsDir.mkdirs()
-            val copyCmd = when {
-                File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "cp", "-dPR", "${stagingDir.absolutePath}/.", rootfsDir.absolutePath)
-                else -> arrayOf("cp", "-a", "${stagingDir.absolutePath}/.", rootfsDir.absolutePath)
+        val backupDir = File(linuxDir, "rootfs_backup_${System.currentTimeMillis()}")
+        var backupCreated = false
+
+        try {
+            // Step 2: Backup existing rootfs if it exists and has content
+            if (rootfsDir.exists() && rootfsDir.isDirectory && !rootfsDir.list().isNullOrEmpty()) {
+                if (rootfsDir.renameTo(backupDir)) {
+                    backupCreated = true
+                } else {
+                    backupDir.mkdirs()
+                    copyPreservingSymlinks(rootfsDir, backupDir)
+                    backupCreated = true
+                    rootfsDir.deleteRecursively()
+                }
             }
-            val process = try {
-                ProcessBuilder(*copyCmd).start()
-            } catch (e: Exception) {
-                null
+
+            // Step 3: Promote staging to rootfs
+            var promoted = stagingDir.renameTo(rootfsDir)
+            if (!promoted) {
+                rootfsDir.mkdirs()
+                val copyCmd = when {
+                    File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "cp", "-dPR", "${stagingDir.absolutePath}/.", rootfsDir.absolutePath)
+                    else -> arrayOf("cp", "-a", "${stagingDir.absolutePath}/.", rootfsDir.absolutePath)
+                }
+                val process = try { ProcessBuilder(*copyCmd).start() } catch (e: Exception) { null }
+                val copyExit = process?.waitFor() ?: -1
+                if (copyExit != 0) {
+                    copyPreservingSymlinks(stagingDir, rootfsDir)
+                }
+                promoted = rootfsDir.exists() && (File(rootfsDir, "bin/bash").exists() || File(rootfsDir, "usr/bin/bash").exists())
             }
-            val exitCode = process?.waitFor() ?: -1
-            if (exitCode != 0) {
-                copyPreservingSymlinks(stagingDir, rootfsDir)
+
+            // Step 4: Post-promotion verification
+            val promotedBash = File(rootfsDir, "bin/bash").exists() || File(rootfsDir, "usr/bin/bash").exists()
+            val promotedSh = File(rootfsDir, "bin/sh").exists() || File(rootfsDir, "usr/bin/sh").exists()
+            if (!promoted || !promotedBash || !promotedSh) {
+                throw IllegalStateException("Promoted rootfs failed post-promotion verification (bash or sh missing).")
             }
-            val hasBash = File(rootfsDir, "bin/bash").exists() || File(rootfsDir, "usr/bin/bash").exists()
-            if (hasBash) {
+
+            // Step 5: Clean staging and remove backup only after verification passes
+            if (stagingDir.exists()) {
                 stagingDir.deleteRecursively()
             }
+            if (backupCreated && backupDir.exists()) {
+                backupDir.deleteRecursively()
+            }
+
+        } catch (t: Throwable) {
+            // Rollback on any failure!
+            if (backupCreated && backupDir.exists()) {
+                if (rootfsDir.exists()) rootfsDir.deleteRecursively()
+                if (!backupDir.renameTo(rootfsDir)) {
+                    rootfsDir.mkdirs()
+                    copyPreservingSymlinks(backupDir, rootfsDir)
+                    backupDir.deleteRecursively()
+                }
+            }
+            throw IllegalStateException("Transactional rootfs promotion failed and was rolled back: ${t.message}", t)
         }
     }
 
@@ -603,17 +653,11 @@ class UbuntuInstaller(
             throw IOException("Extraction target directory does not exist or is not a directory: ${targetDir.absolutePath}")
         }
 
-        var tarExtractorSucceeded = false
-        try {
-            val extractedEntries = TarExtractor.extract(archive, targetDir)
-            if (extractedEntries > 100) {
-                tarExtractorSucceeded = true
-            }
-        } catch (e: Exception) {
-            android.util.Log.w("UbuntuInstaller", "TarExtractor encountered error, falling back to system tar: ${e.message}")
-        }
+        val extractResult = TarExtractor.extractDetailed(archive, targetDir)
+        var extractionSucceeded = extractResult.success
 
-        if (!tarExtractorSucceeded) {
+        if (!extractionSucceeded) {
+            android.util.Log.w("UbuntuInstaller", "TarExtractor encountered issue (${extractResult.detailMessage}), attempting fallback tar...")
             val devExcludes = arrayOf("--exclude=./dev/*", "--exclude=dev/*", "--exclude=./dev", "--exclude=dev")
             val tarCmd = when {
                 File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", archive.absolutePath, "-C", targetDir.absolutePath, *devExcludes)
@@ -626,10 +670,16 @@ class UbuntuInstaller(
                 .start()
 
             val reader = BufferedReader(InputStreamReader(process.inputStream))
-            while (reader.readLine() != null) {
-                // Drain output
+            val output = StringBuilder()
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                output.appendLine(line)
             }
             val exitCode = process.waitFor()
+            if (exitCode != 0) {
+                throw IllegalStateException("Fallback tar extraction failed with exit code $exitCode:\n$output\nOriginal TarExtractor error: ${extractResult.detailMessage}")
+            }
+            extractionSucceeded = true
         }
 
         // Post-extraction verification: ensure shell and essential coreutils exist

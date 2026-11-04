@@ -73,12 +73,13 @@ object PreUpgradeHealthCheck {
 
     /**
      * Essential coreutils and system commands required by POSIX userspace and dpkg maintainer scripts.
-     * Contains all mandatory commands including md5sum and cut for libc-bin.postinst.
+     * Contains all mandatory commands including md5sum and cut for libc-bin.postinst,
+     * as well as sort, uniq, and tr for ca-certificates.config.
      */
     val ESSENTIAL_COMMANDS = listOf(
         "uname", "env", "cat", "ls", "mkdir", "chmod", "touch",
         "cp", "mv", "rm", "ln", "readlink", "sleep", "date",
-        "echo", "test", "true", "md5sum", "cut"
+        "echo", "test", "true", "md5sum", "cut", "sort", "uniq", "tr"
     )
 
     /**
@@ -277,8 +278,64 @@ object PreUpgradeHealthCheck {
             diag.appendLine("[ERROR] uname binary not found in /usr/bin/uname or /bin/uname")
         }
 
-        // 6. Essential Coreutils Command Resolution
+        // 6. Comprehensive Essential Coreutils Command Inspection (Filesystem + ELF + PRoot runtime)
         val missingCmds = mutableListOf<String>()
+
+        // Pass 6A: Host-side inspection of every mandatory utility
+        for (cmd in ESSENTIAL_COMMANDS) {
+            val usrFile = File(rootfsDir, "usr/bin/$cmd")
+            val binFile = File(rootfsDir, "bin/$cmd")
+            val active = when {
+                usrFile.exists() || Files.isSymbolicLink(usrFile.toPath()) -> usrFile
+                binFile.exists() || Files.isSymbolicLink(binFile.toPath()) -> binFile
+                else -> null
+            }
+
+            if (active == null) {
+                missingCmds.add(cmd)
+                diag.appendLine("[ERROR] Mandatory utility '$cmd' not found in /usr/bin or /bin")
+                continue
+            }
+
+            // Check symlink validity
+            if (Files.isSymbolicLink(active.toPath())) {
+                val target = try { Files.readSymbolicLink(active.toPath()) } catch (_: Exception) { null }
+                val resolved = if (target != null) {
+                    if (target.isAbsolute) File(rootfsDir, target.toString().removePrefix("/"))
+                    else File(active.parentFile, target.toString())
+                } else null
+
+                if (resolved == null || !resolved.exists() || (!resolved.canExecute() && resolved.length() == 0L)) {
+                    missingCmds.add(cmd)
+                    diag.appendLine("[ERROR] Utility '$cmd' symlink destination is invalid or unexecutable ($target)")
+                    continue
+                }
+            } else if (!active.canExecute() || active.length() == 0L) {
+                ensurePermissions(active)
+                if (!active.canExecute() && active.length() == 0L) {
+                    missingCmds.add(cmd)
+                    diag.appendLine("[ERROR] Utility '$cmd' is not executable or empty at ${active.absolutePath}")
+                    continue
+                }
+            }
+
+            // Check ELF architecture where applicable
+            if (active.length() >= 4) {
+                try {
+                    val magic = active.readBytes().take(4).toByteArray()
+                    if (magic.contentEquals(byteArrayOf(0x7F, 0x45, 0x4C, 0x46))) {
+                        val elfVal = ElfValidator.validateArm64Elf(active)
+                        if (!elfVal.isValid) {
+                            missingCmds.add(cmd)
+                            diag.appendLine("[ERROR] Utility '$cmd' failed ARM64 ELF validation: ${elfVal.detail}")
+                            continue
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Pass 6B: Runtime verification inside PRoot environment
         val checkScript = StringBuilder("for c in")
         for (cmd in ESSENTIAL_COMMANDS) {
             checkScript.append(" ").append(cmd)
@@ -303,21 +360,13 @@ object PreUpgradeHealthCheck {
         if (coreExit == 0) {
             coreOut.lines().forEach { line ->
                 if (line.startsWith("MISSING:")) {
-                    missingCmds.add(line.removePrefix("MISSING:").trim())
-                }
-            }
-        } else {
-            // Check filesystem directly as fallback
-            ESSENTIAL_COMMANDS.forEach { c ->
-                val f1 = File(rootfsDir, "usr/bin/$c")
-                val f2 = File(rootfsDir, "bin/$c")
-                if (!f1.exists() && !f2.exists()) {
-                    missingCmds.add(c)
+                    val m = line.removePrefix("MISSING:").trim()
+                    if (!missingCmds.contains(m)) missingCmds.add(m)
                 }
             }
         }
         val coreutilsOk = missingCmds.isEmpty()
-        diag.appendLine("[CHECK] Essential coreutils: ${if (coreutilsOk) "OK (all ${ESSENTIAL_COMMANDS.size} present)" else "MISSING: $missingCmds"}")
+        diag.appendLine("[CHECK] Essential coreutils: ${if (coreutilsOk) "OK (all ${ESSENTIAL_COMMANDS.size} present & executable)" else "MISSING: $missingCmds"}")
 
         // 7. DPKG Status Check and Inconsistency Detection
         val dpkgStatusFile = File(rootfsDir, "var/lib/dpkg/status")
@@ -589,12 +638,19 @@ object PreUpgradeHealthCheck {
 
             val dataTar = workDir.listFiles { _, name -> name.startsWith("data.tar") }?.firstOrNull()
             if (dataTar != null) {
-                val tarCmd = when {
-                    File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", dataTar.absolutePath, "-C", targetDir.absolutePath)
-                    else -> arrayOf("tar", "-xpf", dataTar.absolutePath, "-C", targetDir.absolutePath)
+                var extracted = false
+                try {
+                    val extractRes = TarExtractor.extractDetailed(dataTar, targetDir)
+                    extracted = extractRes.success
+                } catch (_: Exception) {}
+                if (!extracted) {
+                    val tarCmd = when {
+                        File("/system/bin/toybox").exists() -> arrayOf("/system/bin/toybox", "tar", "-xpf", dataTar.absolutePath, "-C", targetDir.absolutePath)
+                        else -> arrayOf("tar", "-xpf", dataTar.absolutePath, "-C", targetDir.absolutePath)
+                    }
+                    val tarPb = ProcessBuilder(*tarCmd).start()
+                    tarPb.waitFor()
                 }
-                val tarPb = ProcessBuilder(*tarCmd).start()
-                tarPb.waitFor()
             }
         } catch (_: Exception) {
         } finally {
